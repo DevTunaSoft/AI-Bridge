@@ -1,0 +1,38 @@
+name: Windows checks
+
+# Runs the test suite and the browser checks on a GitHub-hosted Windows machine.
+# It does not touch any personal computer. Real AI chat sites are not used here; the
+# provider in the browser check is a scripted local page (see tools/e2e/fake-provider-roundtrip.cjs).
+
+on:
+  push:
+    branches: [claude/jolly-shannon-p3tocj]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Unit and integration tests (npm test)
+        run: npm test
+
+      - name: Install Playwright and its Chromium
+        run: |
+          npm install --no-save playwright@1.49.0
+          npx playwright install chromium
+
+      - name: Browser check with mocked provider page
+        run: node tools/e2e/fake-provider-roundtrip.cjs
+
+      - name: Browser check: extension connects and round-trips
+        run: node tools/e2e/extension-roundtrip.cjs
