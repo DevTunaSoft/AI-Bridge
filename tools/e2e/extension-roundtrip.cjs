@@ -36,10 +36,13 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // Waits for the AI Bridge extension's own service worker. If it never appears, the error lists every
 // worker and page seen, so a failing run shows what actually loaded.
 async function extensionWorker(context) {
+  // Chromium can run built-in extension workers too, so pick the one whose manifest is AI Bridge.
   const deadline = Date.now() + 20_000;
   while (Date.now() < deadline) {
-    const found = context.serviceWorkers().find((item) => item.url().startsWith("chrome-extension://"));
-    if (found) return found;
+    for (const item of context.serviceWorkers().filter((w) => w.url().startsWith("chrome-extension://"))) {
+      const name = await item.evaluate(() => (typeof chrome !== "undefined" && chrome.runtime?.getManifest?.().name) || null).catch(() => null);
+      if (name === "AI Bridge") return item;
+    }
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   throw new Error(`AI Bridge service worker not found. Workers: ${JSON.stringify(context.serviceWorkers().map((w) => w.url()))}. Pages: ${JSON.stringify(context.pages().map((p) => p.url()))}`);
