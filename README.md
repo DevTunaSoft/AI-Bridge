@@ -29,10 +29,10 @@ This project borrows the practical idea of a web-chat-to-OpenAI gateway from [ge
    npm start
    ```
 
-   On first start it creates `.ai-bridge-token` next to `local-server.mjs`, then prints that bridge token. Leave this terminal running. Future starts reuse the same token, so the extension does not need to be configured again.
+   On first start it creates two secret files next to `local-server.mjs`: `.ai-bridge-token` (for the extension) and `.ai-bridge-api-key` (for your IDE). Secret values are never printed to the terminal; open the files to copy them. Leave this terminal running. Future starts reuse both files.
 
 3. In Chrome, open `chrome://extensions`, turn on **Developer mode**, choose **Load unpacked**, and select the `extension` folder in this project.
-4. Open the AI Bridge extension, paste the printed token, and click **Save & connect**.
+4. Open the AI Bridge extension, paste the token from `.ai-bridge-token`, and click **Save & connect**.
 5. Click a provider in the popup, sign in normally, and leave that tab open. Choose it as the default provider, or use a provider-specific model name.
 
 The server binds only to `127.0.0.1`. It never reads, copies, or uploads Chrome profile files. Each request is serialised because a chat tab can answer only one prompt at a time. While connected, the extension exchanges a heartbeat every 20 seconds, so its Manifest V3 service worker remains active indefinitely on Chrome 116 or newer. The **Pause** button intentionally stops that connection; **Continue** restores it.
@@ -62,21 +62,19 @@ Automatic “name this conversation” requests are detected and completed local
 ```powershell
 curl http://127.0.0.1:4317/v1/chat/completions `
   -H 'Content-Type: application/json' `
+  -H 'Authorization: Bearer <contents of .ai-bridge-api-key>' `
   -d '{"model":"bridge-gemini","messages":[{"role":"user","content":"Explain this error briefly."}]}'
 ```
 
-Most OpenAI clients require a non-empty API key even when a local server does not. Supply any placeholder value unless you opt into local API-key protection:
+API-key authentication is always on. Every `/v1/*` request must send `Authorization: Bearer <API key>`, where the key is the contents of `.ai-bridge-api-key` (created on first start). To choose your own key instead, set `BRIDGE_API_KEY` (at least 16 characters, letters, digits, `.`, `_`, `~` or `-`) before `npm start`. Placeholder keys such as `sk-local` are not accepted.
 
-```powershell
-$env:BRIDGE_API_KEY = 'choose-a-local-secret'
-npm start
-```
-
-With `BRIDGE_API_KEY` set, send `Authorization: Bearer choose-a-local-secret`.
+Browser pages cannot call this API: requests carrying an `Origin` header are refused and no CORS headers are sent. Use your IDE or a command-line client, not a web page.
 
 ### Bridge-token storage
 
-The bridge token is automatically stored in the ignored `.ai-bridge-token` file. Delete that file to rotate the token, then paste the newly printed value into the extension. To use a managed token without writing a file, set `BRIDGE_TOKEN`; to choose another token-file location, pass `--token-file <path>` or set `BRIDGE_TOKEN_FILE`.
+The bridge token is automatically stored in the ignored `.ai-bridge-token` file, with owner-only permissions where the OS supports them. Delete that file to rotate the token, then paste the new value from the file into the extension. To use a managed token without writing a file, set `BRIDGE_TOKEN`; to choose another location, pass `--token-file <path>` or set `BRIDGE_TOKEN_FILE`. The API key follows the same pattern with `.ai-bridge-api-key`, `BRIDGE_API_KEY`, `--api-key-file` and `BRIDGE_API_KEY_FILE`.
+
+The extension sends the token in the WebSocket subprotocol header, never in the URL. Reload the extension after updating the server, because older extension builds that put the token in the URL are refused.
 
 ### Settings
 

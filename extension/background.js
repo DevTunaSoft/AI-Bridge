@@ -18,6 +18,9 @@ const DEFAULT_SETTINGS = {
 };
 
 const HEARTBEAT_INTERVAL_MS = 20_000;
+// Must match local-server.mjs. The token is sent as a subprotocol, never in the URL.
+const WS_PROTOCOL = "ai-bridge.v1";
+const WS_TOKEN_PROTOCOL_PREFIX = "ai-bridge.token.";
 let socket = null;
 let reconnectTimer = null;
 let heartbeatTimer = null;
@@ -94,12 +97,12 @@ async function connect(force = false) {
     updateBadge();
     return;
   }
-  const endpoint = toWebSocketUrl(settings.serverUrl, settings.token);
+  const endpoint = toWebSocketUrl(settings.serverUrl);
   socketState = "connecting";
   lastError = "";
   updateBadge();
   try {
-    socket = new WebSocket(endpoint);
+    socket = new WebSocket(endpoint, [WS_PROTOCOL, `${WS_TOKEN_PROTOCOL_PREFIX}${settings.token.trim()}`]);
   } catch (error) {
     scheduleReconnect(error.message);
     return;
@@ -202,12 +205,12 @@ function sendToServer(message) {
   if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
 }
 
-function toWebSocketUrl(serverUrl, token) {
+function toWebSocketUrl(serverUrl) {
   const url = new URL(serverUrl.trim());
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   url.pathname = "/bridge";
   url.search = "";
-  url.searchParams.set("token", token.trim());
+  url.hash = "";
   return url.toString();
 }
 

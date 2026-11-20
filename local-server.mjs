@@ -16,6 +16,10 @@ import { makeAssistantMessage } from "./tool-calls.mjs";
 const MAX_BODY_BYTES = 1_000_000;
 const MAX_QUEUE_LENGTH = 10;
 const REQUEST_TIMEOUT_MS = 240_000;
+const MIN_SECRET_LENGTH = 16;
+const WS_PROTOCOL = "ai-bridge.v1";
+const WS_TOKEN_PROTOCOL_PREFIX = "ai-bridge.token.";
+const EXTENSION_ORIGIN_PATTERN = /^(?:chrome|moz)-extension:\/\/[a-z0-9]+\/?$/i;
 const PROVIDERS = ["auto", "grok", "gemini", "deepseek", "perplexity", "qwen", "chatgpt", "claude", "zai", "kimi"];
 if (PROVIDERS.slice(1).some((provider) => !PROVIDER_DISPLAY_NAMES[provider])) {
   throw new Error("PROVIDER_DISPLAY_NAMES is missing a provider from PROVIDERS.");
@@ -27,11 +31,13 @@ const DEFAULT_BRIDGE_SETTINGS = Object.freeze({
 
 const args = parseArgs(process.argv.slice(2));
 const port = readPort(args.port ?? process.env.BRIDGE_PORT ?? "4317");
+const allowedHostHeaders = new Set(["127.0.0.1", "localhost", "[::1]"].flatMap((host) => [host, `${host}:${port}`]));
 const tokenConfig = resolveBridgeToken(args);
 const settingsConfig = loadBridgeSettings(args);
 const promptInstructionsDir = resolvePromptInstructionsDirectory(args, settingsConfig.path);
-const bridgeToken = tokenConfig.token;
-const apiKey = args.apiKey ?? process.env.BRIDGE_API_KEY ?? "";
+const bridgeToken = tokenConfig.value;
+const apiKeyConfig = resolveApiKey(args);
+const apiKey = apiKeyConfig.value;
 const interceptTitleRequests = process.env.BRIDGE_INTERCEPT_TITLES === undefined
   ? settingsConfig.settings.interceptTitleRequests
   : process.env.BRIDGE_INTERCEPT_TITLES !== "0";
@@ -50,11 +56,16 @@ const server = http.createServer(async (request, response) => {
     if (!isLoopback(request.socket.remoteAddress)) {
       return sendOpenAiError(response, 403, "AI Bridge only accepts loopback connections.", "forbidden");
     }
-
-    setCorsHeaders(response);
+    if (!allowedHostHeaders.has(String(request.headers.host ?? "").toLowerCase())) {
+      return sendOpenAiError(response, 403, "AI Bridge only accepts requests addressed to a loopback Host.", "forbidden");
+    }
+    // Browser pages always send Origin. The API has no browser clients, so every request carrying
+    // Origin is refused and no CORS grant is ever sent; hostile pages cannot drive the chat tab.
+    if (request.headers.origin !== undefined) {
+      return sendOpenAiError(response, 403, "Browser-origin requests are not accepted by AI Bridge.", "forbidden");
+    }
     if (request.method === "OPTIONS") {
-      response.writeHead(204).end();
-      return;
+      return sendOpenAiError(response, 405, "CORS preflight is not supported.", "method_not_allowed");
     }
 
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
@@ -97,10 +108,18 @@ const server = http.createServer(async (request, response) => {
 server.on("upgrade", (request, socket, head) => {
   try {
     if (!isLoopback(request.socket.remoteAddress)) return rejectUpgrade(socket, 403, "Loopback only");
+    if (!allowedHostHeaders.has(String(request.headers.host ?? "").toLowerCase())) return rejectUpgrade(socket, 403, "Forbidden host");
+    if (request.headers.origin !== undefined && !EXTENSION_ORIGIN_PATTERN.test(String(request.headers.origin))) {
+      return rejectUpgrade(socket, 403, "Forbidden origin");
+    }
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
     if (url.pathname !== "/bridge") return rejectUpgrade(socket, 404, "Not found");
-    if (url.searchParams.get("token") !== bridgeToken) return rejectUpgrade(socket, 401, "Invalid bridge token");
     if (request.headers.upgrade?.toLowerCase() !== "websocket") return rejectUpgrade(socket, 400, "WebSocket required");
+
+    // The token travels in Sec-WebSocket-Protocol, never in the URL, so it is not written to URL logs.
+    const offered = parseOfferedProtocols(request.headers["sec-websocket-protocol"]);
+    const presentedToken = offered.find((protocol) => protocol.startsWith(WS_TOKEN_PROTOCOL_PREFIX))?.slice(WS_TOKEN_PROTOCOL_PREFIX.length) ?? "";
+    if (!offered.includes(WS_PROTOCOL) || !safeEqual(presentedToken, bridgeToken)) return rejectUpgrade(socket, 401, "Invalid bridge token");
 
     const key = request.headers["sec-websocket-key"];
     if (typeof key !== "string") return rejectUpgrade(socket, 400, "Missing WebSocket key");
@@ -110,6 +129,7 @@ server.on("upgrade", (request, socket, head) => {
       "Upgrade: websocket",
       "Connection: Upgrade",
       `Sec-WebSocket-Accept: ${accept}`,
+      `Sec-WebSocket-Protocol: ${WS_PROTOCOL}`,
       "",
       "",
     ].join("\r\n"));
@@ -133,12 +153,15 @@ server.on("upgrade", (request, socket, head) => {
 server.listen(port, "127.0.0.1", () => {
   log(`AI Bridge listening at http://127.0.0.1:${port}`);
   log(`Extension WebSocket: ws://127.0.0.1:${port}/bridge`);
-  log(`Bridge token: ${bridgeToken}`);
-  if (tokenConfig.path) log(`Bridge token file: ${tokenConfig.path}`);
+  // Secret values are never written to logs; only where they are stored.
+  log(tokenConfig.path
+    ? `Bridge token file: ${tokenConfig.path} (open it to copy the token into the extension; the value is not printed)`
+    : "Bridge token supplied by --token or BRIDGE_TOKEN (the value is not printed).");
+  log(apiKeyConfig.path
+    ? `API key file: ${apiKeyConfig.path} (the value is not printed)`
+    : "API key supplied by --api-key or BRIDGE_API_KEY (the value is not printed).");
   log(`Settings file: ${settingsConfig.path}`);
   log(`Prompt instructions: ${promptInstructionsDir}`);
-  if (!apiKey) log("API key authentication is disabled (loopback-only mode).");
-  else log("API key authentication is enabled.");
 });
 
 function handleChatCompletion(request, response, payload) {
@@ -574,18 +597,23 @@ function rejectUpgrade(socket, status, message) {
 }
 
 function isAuthorized(request) {
-  if (!apiKey) return true;
-  return request.headers.authorization === `Bearer ${apiKey}`;
+  const match = /^Bearer\s+(\S+)$/i.exec(String(request.headers.authorization ?? ""));
+  return match !== null && safeEqual(match[1], apiKey);
+}
+
+function safeEqual(candidate, expected) {
+  const left = Buffer.from(String(candidate), "utf8");
+  const right = Buffer.from(String(expected), "utf8");
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
+function parseOfferedProtocols(value) {
+  if (typeof value !== "string") return [];
+  return value.split(",").map((item) => item.trim()).filter(Boolean);
 }
 
 function isLoopback(address) {
   return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
-}
-
-function setCorsHeaders(response) {
-  response.setHeader("Access-Control-Allow-Origin", "*");
-  response.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
-  response.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
 }
 
 function sendJson(response, status, payload) {
@@ -620,24 +648,50 @@ function readPort(value) {
 }
 
 function resolveBridgeToken(options) {
-  const supplied = options.token ?? process.env.BRIDGE_TOKEN;
-  if (supplied) return { token: supplied, path: null };
-
   const serverDirectory = path.dirname(fileURLToPath(import.meta.url));
-  const tokenPath = path.resolve(options.tokenFile ?? options["token-file"] ?? process.env.BRIDGE_TOKEN_FILE ?? path.join(serverDirectory, ".ai-bridge-token"));
-  const existing = readTokenFile(tokenPath);
-  if (existing) return { token: existing, path: tokenPath };
+  return resolveSecret({
+    label: "Bridge token",
+    supplied: options.token ?? process.env.BRIDGE_TOKEN,
+    filePath: options.tokenFile ?? options["token-file"] ?? process.env.BRIDGE_TOKEN_FILE ?? path.join(serverDirectory, ".ai-bridge-token"),
+  });
+}
+
+function resolveApiKey(options) {
+  const serverDirectory = path.dirname(fileURLToPath(import.meta.url));
+  return resolveSecret({
+    label: "API key",
+    supplied: options["api-key"] ?? process.env.BRIDGE_API_KEY,
+    filePath: options.apiKeyFile ?? options["api-key-file"] ?? process.env.BRIDGE_API_KEY_FILE ?? path.join(serverDirectory, ".ai-bridge-api-key"),
+  });
+}
+
+// Supplied secrets are validated; otherwise a strong secret is generated once into a 0600 file.
+// The returned value is never logged by callers.
+function resolveSecret({ label, supplied, filePath }) {
+  if (supplied) return { value: validateSecret(supplied, label), path: null };
+
+  const secretPath = path.resolve(filePath);
+  const existing = readTokenFile(secretPath);
+  if (existing) return { value: validateSecret(existing, label), path: secretPath };
 
   const generated = crypto.randomBytes(24).toString("base64url");
   try {
-    fs.writeFileSync(tokenPath, `${generated}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
-    return { token: generated, path: tokenPath };
+    fs.writeFileSync(secretPath, `${generated}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    return { value: generated, path: secretPath };
   } catch (error) {
-    if (error?.code !== "EEXIST") throw new Error(`Could not create bridge token file at ${tokenPath}: ${error.message}`);
-    const tokenCreatedElsewhere = readTokenFile(tokenPath);
-    if (tokenCreatedElsewhere) return { token: tokenCreatedElsewhere, path: tokenPath };
-    throw new Error(`Bridge token file at ${tokenPath} is empty.`);
+    if (error?.code !== "EEXIST") throw new Error(`Could not create ${label.toLowerCase()} file at ${secretPath}: ${error.message}`);
+    const createdElsewhere = readTokenFile(secretPath);
+    if (createdElsewhere) return { value: validateSecret(createdElsewhere, label), path: secretPath };
+    throw new Error(`${label} file at ${secretPath} is empty.`);
   }
+}
+
+function validateSecret(value, label) {
+  const trimmed = String(value).trim();
+  if (trimmed.length < MIN_SECRET_LENGTH || !/^[A-Za-z0-9._~-]+$/.test(trimmed)) {
+    throw new Error(`${label} must be at least 16 characters and use only letters, digits, '.', '_', '~' or '-'.`);
+  }
+  return trimmed;
 }
 
 function loadBridgeSettings(options) {
