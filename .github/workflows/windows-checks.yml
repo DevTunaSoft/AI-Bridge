@@ -23,7 +23,7 @@ jobs:
         with:
           node-version: 22
 
-      - name: Unit and integration tests (npm test)
+      - name: "Unit and integration tests (npm test)"
         run: npm test
 
       - name: Install Playwright and its Chromium
@@ -34,5 +34,5 @@ jobs:
       - name: Browser check with mocked provider page
         run: node tools/e2e/fake-provider-roundtrip.cjs
 
-      - name: Browser check: extension connects and round-trips
+      - name: "Browser check: extension connects and round-trips"
         run: node tools/e2e/extension-roundtrip.cjs
