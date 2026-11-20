@@ -28,9 +28,9 @@ let socketState = "disconnected";
 let lastError = "";
 let closingForPause = false;
 
-chrome.runtime.onInstalled.addListener(async () => {
-  const existing = await chrome.storage.local.get(DEFAULT_SETTINGS);
-  await chrome.storage.local.set(existing);
+chrome.runtime.onInstalled.addListener(() => {
+  // Defaults are applied on every read via DEFAULT_SETTINGS, so nothing is written here. Writing
+  // defaults back on install raced with settings the user had just saved and could erase them.
   connect();
 });
 

@@ -20,6 +20,8 @@ const MIN_SECRET_LENGTH = 16;
 const WS_PROTOCOL = "ai-bridge.v1";
 const WS_TOKEN_PROTOCOL_PREFIX = "ai-bridge.token.";
 const EXTENSION_ORIGIN_PATTERN = /^(?:chrome|moz)-extension:\/\/[a-z0-9]+\/?$/i;
+const MAX_RESPONSE_CHARS = 2_000_000;
+const RESPONSE_TOO_LARGE_MESSAGE = "The web chat response exceeded the bridge size limit.";
 const PROVIDERS = ["auto", "grok", "gemini", "deepseek", "perplexity", "qwen", "chatgpt", "claude", "zai", "kimi"];
 if (PROVIDERS.slice(1).some((provider) => !PROVIDER_DISPLAY_NAMES[provider])) {
   throw new Error("PROVIDER_DISPLAY_NAMES is missing a provider from PROVIDERS.");
@@ -38,6 +40,8 @@ const promptInstructionsDir = resolvePromptInstructionsDirectory(args, settingsC
 const bridgeToken = tokenConfig.value;
 const apiKeyConfig = resolveApiKey(args);
 const apiKey = apiKeyConfig.value;
+const rateLimitPerMinute = readPositiveInteger(args["rate-limit-per-minute"] ?? process.env.BRIDGE_RATE_LIMIT_PER_MINUTE ?? "60", "Rate limit per minute");
+const rateBucket = { tokens: rateLimitPerMinute, updatedAt: Date.now() };
 const interceptTitleRequests = process.env.BRIDGE_INTERCEPT_TITLES === undefined
   ? settingsConfig.settings.interceptTitleRequests
   : process.env.BRIDGE_INTERCEPT_TITLES !== "0";
@@ -69,6 +73,10 @@ const server = http.createServer(async (request, response) => {
     }
 
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
+    if (url.pathname.startsWith("/v1/") && !consumeRateToken()) {
+      response.setHeader("Retry-After", String(Math.ceil(60 / rateLimitPerMinute)));
+      return sendOpenAiError(response, 429, "AI Bridge rate limit reached. Try again shortly.", "rate_limit_error");
+    }
     if (request.method === "GET" && url.pathname === "/health") {
       return sendJson(response, 200, {
         ok: true,
@@ -315,6 +323,7 @@ function handleExtensionMessage(client, message) {
   if (message.type === "bridge:chunk") {
     const text = typeof message.text === "string" ? message.text : "";
     if (!text) return;
+    if (job.text.length + text.length > MAX_RESPONSE_CHARS) return finishJobWithError(job, RESPONSE_TOO_LARGE_MESSAGE);
     job.text += text;
     // When tools are present, buffer until complete so we can lift JSON into tool_calls
     // instead of streaming it as ordinary assistant content the IDE will ignore.
@@ -323,6 +332,7 @@ function handleExtensionMessage(client, message) {
   }
   if (message.type === "bridge:complete") {
     if (typeof message.text === "string" && message.text) {
+      if (message.text.length > MAX_RESPONSE_CHARS) return finishJobWithError(job, RESPONSE_TOO_LARGE_MESSAGE);
       if (!job.text || message.text.length >= job.text.length) job.text = message.text;
     }
     finishJob(job);
@@ -599,6 +609,23 @@ function rejectUpgrade(socket, status, message) {
 function isAuthorized(request) {
   const match = /^Bearer\s+(\S+)$/i.exec(String(request.headers.authorization ?? ""));
   return match !== null && safeEqual(match[1], apiKey);
+}
+
+// Token bucket for /v1/* requests: capacity and refill are both rateLimitPerMinute per minute.
+function consumeRateToken() {
+  const now = Date.now();
+  const refill = ((now - rateBucket.updatedAt) / 60_000) * rateLimitPerMinute;
+  rateBucket.tokens = Math.min(rateLimitPerMinute, rateBucket.tokens + refill);
+  rateBucket.updatedAt = now;
+  if (rateBucket.tokens < 1) return false;
+  rateBucket.tokens -= 1;
+  return true;
+}
+
+function readPositiveInteger(value, label) {
+  const parsed = Number.parseInt(String(value), 10);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 10_000) throw new Error(`${label} must be an integer between 1 and 10000.`);
+  return parsed;
 }
 
 function safeEqual(candidate, expected) {

@@ -70,6 +70,8 @@ API-key authentication is always on. Every `/v1/*` request must send `Authorizat
 
 Browser pages cannot call this API: requests carrying an `Origin` header are refused and no CORS headers are sent. Use your IDE or a command-line client, not a web page.
 
+The `/v1/*` routes are limited to 60 requests per minute. Requests above that get HTTP 429 with a `Retry-After` header. Set `BRIDGE_RATE_LIMIT_PER_MINUTE` (1 to 10000) to change the limit.
+
 ### Bridge-token storage
 
 The bridge token is automatically stored in the ignored `.ai-bridge-token` file, with owner-only permissions where the OS supports them. Delete that file to rotate the token, then paste the new value from the file into the extension. To use a managed token without writing a file, set `BRIDGE_TOKEN`; to choose another location, pass `--token-file <path>` or set `BRIDGE_TOKEN_FILE`. The API key follows the same pattern with `.ai-bridge-api-key`, `BRIDGE_API_KEY`, `--api-key-file` and `BRIDGE_API_KEY_FILE`.

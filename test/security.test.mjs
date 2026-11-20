@@ -218,6 +218,46 @@ test("WebSocket upgrade accepts the extension origin and echoes the protocol", a
   assert.doesNotMatch(accepted.raw, new RegExp(TOKEN));
 });
 
+test("HTTP API is rate limited per minute, while health stays available", async (context) => {
+  const server = await startServer(context, [`--token=${TOKEN}`, `--api-key=${API_KEY}`, "--rate-limit-per-minute=5"]);
+  const auth = { authorization: `Bearer ${API_KEY}` };
+  for (let index = 0; index < 5; index += 1) {
+    assert.equal((await httpRequest(server.port, { target: "/v1/models", headers: auth })).status, 200);
+  }
+  const limited = await httpRequest(server.port, { target: "/v1/models", headers: auth });
+  assert.equal(limited.status, 429);
+  assert.ok(limited.headers["retry-after"], "429 must say when to retry");
+  assert.equal((await httpRequest(server.port, { target: "/health" })).status, 200);
+});
+
+test("a runaway extension response is cut off at the size cap instead of growing without bound", async (context) => {
+  const server = await startServer(context, [`--token=${TOKEN}`, `--api-key=${API_KEY}`]);
+  const extension = new WebSocket(`ws://127.0.0.1:${server.port}/bridge`, [WS_PROTOCOL, `ai-bridge.token.${TOKEN}`]);
+  context.after(() => extension.close());
+  await new Promise((resolve, reject) => {
+    extension.addEventListener("open", resolve, { once: true });
+    extension.addEventListener("error", () => reject(new Error("Extension test socket could not connect.")), { once: true });
+  });
+  extension.addEventListener("message", (event) => {
+    const message = JSON.parse(event.data);
+    if (message.type !== "bridge:run") return;
+    const chunk = "a".repeat(900_000);
+    for (let index = 0; index < 3; index += 1) {
+      extension.send(JSON.stringify({ type: "bridge:chunk", id: message.id, text: chunk }));
+    }
+  });
+  extension.send(JSON.stringify({ type: "bridge:hello", version: "test", providers: [] }));
+
+  const reply = await httpRequest(server.port, {
+    method: "POST",
+    target: "/v1/chat/completions",
+    headers: { "content-type": "application/json", authorization: `Bearer ${API_KEY}` },
+    body: JSON.stringify({ model: "bridge-auto", messages: [{ role: "user", content: "stress" }] }),
+  });
+  assert.equal(reply.status, 502);
+  assert.match(reply.text, /size limit/);
+});
+
 test("refuses to start with a bridge token or API key shorter than 16 characters", async (context) => {
   const port = await freePort();
   const child = spawn(process.execPath, ["local-server.mjs", `--port=${port}`, "--token=short", `--api-key=${API_KEY}`], {

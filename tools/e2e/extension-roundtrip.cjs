@@ -60,9 +60,6 @@ async function waitUntil(label, predicate, timeoutMs) {
     if (!worker) worker = await context.waitForEvent("serviceworker", { timeout: 15_000 });
     results.extensionLoaded = worker.url().startsWith("chrome-extension://");
 
-    // Let the first-install onInstalled handler finish writing defaults before our settings,
-    // otherwise its late write can overwrite them (a race in a brand-new profile only).
-    await sleep(2000);
     await worker.evaluate((settings) => chrome.storage.local.set(settings), {
       serverUrl: `http://127.0.0.1:${PORT}`,
       token: TOKEN,

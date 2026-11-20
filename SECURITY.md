@@ -19,12 +19,12 @@ Status legend: **Fixed** = code change plus automated regression test that faile
 | S-08 | Token comparison used `!==` (not constant-time). | Low | **Fixed** | Covered by `safeEqual` in the WebSocket and API tests (behavioural only) |
 | S-09 | Weak or placeholder secrets accepted (e.g. `choose-a-local-secret`, `test`). | Medium | **Fixed** | `refuses to start with a bridge token or API key shorter than 16 characters` |
 | S-10 | Extension popup placeholder and README told users to copy a printed token. | Low | **Fixed** | Docs and `popup.html` updated to read `.ai-bridge-token` |
-| S-11 | No rate limiting on the HTTP API or WebSocket messages. | Medium | **Open** | Queue bound (10) limits backlog only. Needs per-client token-bucket and body/message rate limits. |
+| S-11 | No rate limiting on the HTTP API; extension responses could grow without bound. | Medium | **Partial** | Added a token bucket on `/v1/*` (default 60/min, `BRIDGE_RATE_LIMIT_PER_MINUTE` or `--rate-limit-per-minute`, returns 429 with `Retry-After`) and a 2,000,000-character cap per response. Evidence: `HTTP API is rate limited per minute…`; `a runaway extension response is cut off…`. **Gap:** WebSocket message rate is not limited, and the limit is global because the server is loopback-only. |
 | S-12 | `/health` is unauthenticated and reveals connected-extension count, active request ID and queue length. | Low | **Open (decision)** | Loopback-only and Host/Origin-checked. Owner to decide whether to require auth or reduce fields. |
 | S-13 | Token and API-key files on Windows do not get owner-only ACLs (`mode 0600` is ignored there). | Medium | **Open** | Needs Windows ACL hardening (P6). README notes the limitation. |
 | S-14 | Extension requests `tabs` permission and loopback host permissions it may not need. | Low | **Open** | Minimum-permission review pending (P1 follow-up). |
 | S-15 | Extension accepts `bridge:site-message` from any content script without schema validation. | Low | **Open** | Content scripts run only on the nine named sites. Schema validation pending. |
-| S-16 | First-install race: `onInstalled` writes defaults after the user saves settings, which can overwrite them in a brand-new profile. | Low | **Open** | Reproduced in headless Chromium; the test waits for it. Fix: merge defaults rather than overwrite. |
+| S-16 | First-install race: `onInstalled` wrote defaults back to storage, which could overwrite settings saved just after install (reproduced once in headless Chromium, and the storage probe showed the overwrite). | Low | **Fixed** | Removed the write-back; defaults are applied on read. Evidence: `tools/e2e/extension-roundtrip.cjs` passes twice in a row with no wait before saving settings. |
 | S-17 | Tool-call extraction is best-effort (quoted text and prose can become tool calls). | High (for unattended use) | **Open — P2** | Requires strict delimiter, schema validation and allowlist work; not part of P1. |
 
 ## Behaviour changes (breaking, intentional)
@@ -33,6 +33,7 @@ Status legend: **Fixed** = code change plus automated regression test that faile
 - The bridge token is never printed. Copy it from `.ai-bridge-token`.
 - Browser pages cannot call the HTTP API: any request with an `Origin` header is refused, and no CORS headers are sent.
 - The extension must be reloaded after the server is updated, because it now sends the token in `Sec-WebSocket-Protocol` and tokens in the URL are refused.
+- `/v1/*` requests are limited to 60 per minute by default. Excess requests get HTTP 429 with `Retry-After`. Set `BRIDGE_RATE_LIMIT_PER_MINUTE` to change this. The 60/min default is a judgement call for the owner to confirm.
 
 ## Verification
 

@@ -15,6 +15,8 @@ Status is evidence-based. "Verified" means an automated test or a real-browser r
 | **API-key authentication (mandatory)** | Verified (test) | Changed in P1: always required; auto-generated to `.ai-bridge-api-key` |
 | **Bridge token (WebSocket)** | Verified (test + Chromium) | Changed in P1: sent in subprotocol, never printed |
 | **CORS** | Removed (test) | No `Access-Control-*` headers; `Origin` requests refused |
+| **HTTP rate limit (`/v1/*`)** | Verified (test) | 60/min default, 429 + `Retry-After`; `/health` exempt |
+| **Response size cap** | Verified (test) | 2,000,000 characters per response; oversize returns 502 |
 | **Host / Origin checks** | Verified (test) | Loopback Host only; extension origin only on WebSocket |
 | Chrome MV3 extension connects and round-trips | Verified (headless Chromium, Linux) | `tools/e2e/extension-roundtrip.cjs` |
 | Microsoft Edge extension | **Not verified** | Not run |

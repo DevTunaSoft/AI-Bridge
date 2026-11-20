@@ -5,8 +5,8 @@ Read first: `AGENTS.md`, `MASTER_ENGINEERING_PLAN.md`, `MASTER_AUTONOMOUS_DEVELO
 ## Where things stand
 
 - Branch: `claude/jolly-shannon-p3tocj` (the designated development branch for this session). Base: `main` at `589d774`.
-- P1 security hardening is done for the audited items S-01 to S-10. Each fix has a test that failed before the fix.
-- `npm test`: 28/28 pass. `node tools/e2e/extension-roundtrip.cjs`: passes on headless Chromium (Linux).
+- P1 security hardening: S-01 to S-10 and S-16 are fixed. S-11 is partly fixed (HTTP rate limit and response size cap). Each fix has a test that failed before the fix.
+- `npm test`: 30/30 pass. `node tools/e2e/extension-roundtrip.cjs`: passes on headless Chromium (Linux), two consecutive runs.
 - Not done: upstream pin (P0), real AI chat tabs, Edge, Windows, the P2 tool-call contract.
 
 ## Breaking changes to communicate
@@ -36,5 +36,5 @@ Read first: `AGENTS.md`, `MASTER_ENGINEERING_PLAN.md`, `MASTER_AUTONOMOUS_DEVELO
 
 ## Next steps
 
-1. Pick up P1 follow-ups: S-11 rate limiting, S-16 install race, S-15 message validation.
+1. Pick up P1 follow-ups: S-15 site-message validation, WebSocket message rate (rest of S-11), S-14 permission review.
 2. Start P2: strict tool-call contract with negative tests (S-17). Do not claim OpenCode support until a real OpenCode run passes.
