@@ -258,6 +258,21 @@ test("a runaway extension response is cut off at the size cap instead of growing
   assert.match(reply.text, /size limit/);
 });
 
+test("an extension socket that floods messages is disconnected with policy violation", async (context) => {
+  const server = await startServer(context, [`--token=${TOKEN}`, `--api-key=${API_KEY}`]);
+  const extension = new WebSocket(`ws://127.0.0.1:${server.port}/bridge`, [WS_PROTOCOL, `ai-bridge.token.${TOKEN}`]);
+  context.after(() => extension.close());
+  const closed = new Promise((resolve) => extension.addEventListener("close", resolve, { once: true }));
+  await new Promise((resolve, reject) => {
+    extension.addEventListener("open", resolve, { once: true });
+    extension.addEventListener("error", () => reject(new Error("Extension test socket could not connect.")), { once: true });
+  });
+  for (let index = 0; index < 400; index += 1) extension.send(JSON.stringify({ type: "bridge:ping" }));
+  const outcome = await Promise.race([closed, new Promise((resolve) => setTimeout(() => resolve(null), 5_000))]);
+  assert.ok(outcome, "flooding socket was not disconnected");
+  assert.equal(outcome.code, 1008);
+});
+
 test("refuses to start with a bridge token or API key shorter than 16 characters", async (context) => {
   const port = await freePort();
   const child = spawn(process.execPath, ["local-server.mjs", `--port=${port}`, "--token=short", `--api-key=${API_KEY}`], {

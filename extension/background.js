@@ -19,6 +19,10 @@ const DEFAULT_SETTINGS = {
 
 const HEARTBEAT_INTERVAL_MS = 20_000;
 // Must match local-server.mjs. The token is sent as a subprotocol, never in the URL.
+import { acceptSiteMessage } from "./site-message-policy.js";
+
+// Job id -> tab id the server's job was dispatched to. Site messages must come from that tab.
+const jobTabs = new Map();
 const WS_PROTOCOL = "ai-bridge.v1";
 const WS_TOKEN_PROTOCOL_PREFIX = "ai-bridge.token.";
 let socket = null;
@@ -67,8 +71,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message?.type === "bridge:site-message") {
-    const provider = providerForUrl(sender.tab?.url);
-    sendToServer({ ...message.message, provider });
+    const accepted = acceptSiteMessage(message.message, {
+      senderId: sender.id,
+      runtimeId: chrome.runtime.id,
+      senderTabId: sender.tab?.id,
+      jobTabs,
+    });
+    if (!accepted) return;
+    if (accepted.type !== "bridge:chunk") jobTabs.delete(accepted.id);
+    sendToServer(accepted);
   }
 });
 
@@ -184,10 +195,12 @@ async function handleServerMessage(message) {
     return;
   }
   try {
+    jobTabs.set(message.id, tab.id);
     await chrome.tabs.sendMessage(tab.id, { type: "bridge:run", id: message.id, prompt: message.prompt });
     await chrome.tabs.update(tab.id, { active: true });
     await chrome.windows.update(tab.windowId, { focused: true });
   } catch {
+    jobTabs.delete(message.id);
     sendToServer({ type: "bridge:error", id: message.id, message: "The AI Bridge content script is not ready in the selected tab. Reload that tab and retry." });
   }
 }
@@ -224,11 +237,6 @@ async function openProvider(provider) {
     return;
   }
   await chrome.tabs.create({ url: item.home, active: true });
-}
-
-function providerForUrl(url) {
-  if (!url) return null;
-  return Object.entries(PROVIDERS).find(([, item]) => item.matches.some((pattern) => url.startsWith(pattern.replace("*", ""))))?.[0] ?? null;
 }
 
 async function getState() {

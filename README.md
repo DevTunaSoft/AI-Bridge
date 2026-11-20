@@ -86,8 +86,8 @@ The extension sends the token in the WebSocket subprotocol header, never in the 
 {
   "interceptTitleRequests": true,
   "injectPromptInstructionsEveryMessage": true,
-  "prePrompt": "Generic Pre-prompt",
-  "postPrompt": "Generic Post-prompt",
+  "prePrompt": "",
+  "postPrompt": "",
   "// disguiseModelNameAsAssistant": "Turning on may increase responsiveness of a model to the prompt",
   "disguiseModelNameAsAssistant": false
 }
@@ -111,7 +111,7 @@ prompt-instructions/
     ZCode Post-prompt.md
 ```
 
-- `prePrompt` / `postPrompt` name the active file stem (with or without `.md`). Set either to `""` to disable that side.
+- `prePrompt` / `postPrompt` name the active file stem (with or without `.md`). They default to `""` (off), because the text is typed into the visible chat. Name a file to opt in.
 - Pre-prompt text is placed at the very start of the outgoing prompt; post-prompt text at the very end.
 - With `injectPromptInstructionsEveryMessage: true` (default), both are injected on every chat completion. Set it to `false` to inject only on the first user turn of a conversation (`messages` has at most one `role: "user"` entry).
 - Use `{{modelName}}` in either file for the provider display name (for example `Claude`, `Gemini`, `ChatGPT`). Prefer a provider-specific model (`bridge-claude`, …) so the server can substitute immediately; with `bridge-auto`, the placeholder is filled by the content script from the live tab hostname.
@@ -122,7 +122,10 @@ prompt-instructions/
 
 - This uses the visible web UI, not a provider's private or undocumented network API. UI changes can require selector updates in `extension/content.js`.
 - You are responsible for the terms, plan limits, and acceptable-use rules of every provider you choose to connect.
-- File uploads, images, provider-specific citations, and native tool execution are outside the first version. When the IDE sends a `tools` array, the bridge best-effort detects JSON tool-call text from the chat tab (bare, fenced, or prose-wrapped) and returns OpenAI `tool_calls` for both streaming and non-streaming requests.
+- File uploads, images, provider-specific citations, and native tool execution are outside the first version.
+- Tool calls use a strict protocol. The bridge asks the chat tab for one block wrapped in markers with a random per-request nonce. It returns OpenAI `tool_calls` only when the whole reply is that block, the tool was offered, and the arguments match the tool's JSON schema. Bare JSON, fenced JSON and quoted examples are treated as plain text. A block that breaks any rule returns HTTP 502 instead of guessing. Schemas that use keywords the bridge cannot enforce (for example `oneOf`, `$ref`) are refused with HTTP 400. OpenCode still enforces its own permissions for every action.
+- Earlier tool calls and tool results are included in the transcript sent to the chat tab. A tool result whose `tool_call_id` does not match an earlier call is refused with HTTP 400.
+- Anything the bridge types into the chat, including the tool-protocol instructions and the full transcript, is visible in that chat's history.
 - Claude responses are intentionally emitted once its final response block is stable, rather than streaming its intermediate thinking/status blocks into the IDE.
 - Keep the requested provider page fully loaded. If a request says the content script is not ready, reload that tab.
 - The extension has permissions only for the nine named chat websites and localhost; it does not have broad `<all_urls>` access.

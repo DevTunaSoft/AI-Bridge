@@ -11,7 +11,14 @@ import {
   buildPromptWithInstructions,
   ensurePromptInstructionsLayout,
 } from "./prompt-instructions.mjs";
-import { makeAssistantMessage } from "./tool-calls.mjs";
+import {
+  ToolProtocolError,
+  assertOfferedTools,
+  createCallNonce,
+  describeToolProtocol,
+  makeAssistantMessage,
+  validateToolTranscript,
+} from "./tool-calls.mjs";
 
 const MAX_BODY_BYTES = 1_000_000;
 const MAX_QUEUE_LENGTH = 10;
@@ -21,6 +28,8 @@ const WS_PROTOCOL = "ai-bridge.v1";
 const WS_TOKEN_PROTOCOL_PREFIX = "ai-bridge.token.";
 const EXTENSION_ORIGIN_PATTERN = /^(?:chrome|moz)-extension:\/\/[a-z0-9]+\/?$/i;
 const MAX_RESPONSE_CHARS = 2_000_000;
+const WS_MESSAGE_BURST = 200;
+const WS_MESSAGES_PER_SECOND = 100;
 const RESPONSE_TOO_LARGE_MESSAGE = "The web chat response exceeded the bridge size limit.";
 const PROVIDERS = ["auto", "grok", "gemini", "deepseek", "perplexity", "qwen", "chatgpt", "claude", "zai", "kimi"];
 if (PROVIDERS.slice(1).some((provider) => !PROVIDER_DISPLAY_NAMES[provider])) {
@@ -152,7 +161,11 @@ server.on("upgrade", (request, socket, head) => {
       log(`Chrome extension disconnected (${clients.size} active).`);
       failJobsForClient(client, "The Chrome extension disconnected while the request was running.");
     };
-    client.onMessage = (message) => handleExtensionMessage(client, message);
+    client.onMessage = (message) => {
+      // A flooding client gets disconnected rather than being allowed to exhaust the event loop.
+      if (!consumeMessageToken(client)) return closeWebSocket(client, 1008, "Too many messages");
+      handleExtensionMessage(client, message);
+    };
   } catch {
     socket.destroy();
   }
@@ -182,6 +195,14 @@ function handleChatCompletion(request, response, payload) {
   if (interceptTitleRequests && isConversationTitleRequest(payload.messages)) {
     return sendConversationTitle(response, payload);
   }
+  const tools = Array.isArray(payload.tools) ? payload.tools : [];
+  try {
+    if (tools.length > 0) assertOfferedTools(tools);
+    validateToolTranscript(payload.messages);
+  } catch (error) {
+    if (error instanceof ToolProtocolError) return sendOpenAiError(response, 400, error.message, "invalid_request_error", "tools");
+    throw error;
+  }
   if (clients.size === 0) {
     return sendOpenAiError(response, 503, "No Chrome extension is connected. Start the local server, then configure and enable the extension.", "bridge_unavailable");
   }
@@ -190,9 +211,9 @@ function handleChatCompletion(request, response, payload) {
   }
 
   const provider = providerForModel(payload.model);
-  const tools = Array.isArray(payload.tools) ? payload.tools : [];
+  const nonce = tools.length > 0 ? createCallNonce() : null;
   const prompt = buildPromptWithInstructions(
-    formatPrompt(payload.messages, tools),
+    formatPrompt(payload.messages, tools, nonce),
     payload.messages,
     provider,
     {
@@ -209,6 +230,7 @@ function handleChatCompletion(request, response, payload) {
     provider,
     prompt,
     tools,
+    nonce,
     hasTools: tools.length > 0,
     stream: payload.stream === true,
     streamedContent: false,
@@ -345,15 +367,22 @@ function handleExtensionMessage(client, message) {
 
 function finishJob(job) {
   if (job.done) return;
+  // Parse before marking the job done: a rejected reply must reach finishJobWithError, which needs the job open.
+  let message;
+  try {
+    message = makeAssistantMessage(job.text, { tools: job.tools, nonce: job.nonce });
+  } catch (error) {
+    const reason = error instanceof ToolProtocolError ? error.message : "unexpected parser error";
+    return finishJobWithError(job, `The model's tool reply was rejected (${reason}).`);
+  }
   job.done = true;
   clearTimeout(job.timer);
   jobs.delete(job.id);
   if (activeJob === job) activeJob = null;
 
   if (job.stream) {
-    finishStreamingJob(job);
+    finishStreamingJob(job, message);
   } else {
-    const message = makeAssistantMessage(job.text, job.tools);
     sendJson(job.response, 200, {
       id: `chatcmpl-${crypto.randomUUID()}`,
       object: "chat.completion",
@@ -365,24 +394,21 @@ function finishJob(job) {
   dispatchNext();
 }
 
-function finishStreamingJob(job) {
-  if (job.hasTools) {
-    const message = makeAssistantMessage(job.text, job.tools);
-    if (message.tool_calls) {
-      const call = message.tool_calls[0];
-      writeSse(job.response, makeStreamChunk(job, {
-        tool_calls: [{
-          index: 0,
-          id: call.id,
-          type: "function",
-          function: { name: call.function.name, arguments: call.function.arguments },
-        }],
-      }, null));
-      writeSse(job.response, makeStreamChunk(job, {}, "tool_calls"));
-      writeSse(job.response, "[DONE]");
-      job.response.end();
-      return;
-    }
+function finishStreamingJob(job, message) {
+  if (message.tool_calls) {
+    const call = message.tool_calls[0];
+    writeSse(job.response, makeStreamChunk(job, {
+      tool_calls: [{
+        index: 0,
+        id: call.id,
+        type: "function",
+        function: { name: call.function.name, arguments: call.function.arguments },
+      }],
+    }, null));
+    writeSse(job.response, makeStreamChunk(job, {}, "tool_calls"));
+    writeSse(job.response, "[DONE]");
+    job.response.end();
+    return;
   }
 
   if (!job.streamedContent && job.text) writeChunk(job, job.text);
@@ -443,13 +469,21 @@ function makeStreamChunk(job, delta, finishReason) {
   };
 }
 
-function formatPrompt(messages, tools) {
+function formatPrompt(messages, tools, nonce) {
   const transcript = messages.map((message) => {
+    if (message.role === "tool") {
+      return `TOOL RESULT (tool_call_id=${message.tool_call_id}):\n${contentToText(message.content)}`;
+    }
     const role = typeof message.role === "string" ? message.role.toUpperCase() : "USER";
-    return `${role}:\n${contentToText(message.content)}`;
+    const calls = (Array.isArray(message.tool_calls) ? message.tool_calls : []).map((call) => {
+      const args = typeof call?.function?.arguments === "string" ? call.function.arguments : JSON.stringify(call?.function?.arguments ?? {});
+      return `[tool call id=${call?.id} name=${call?.function?.name ?? ""}] arguments: ${args}`;
+    });
+    const body = [contentToText(message.content), ...calls].filter((part) => part !== "").join("\n");
+    return `${role}:\n${body}`;
   }).join("\n\n");
   if (!Array.isArray(tools) || tools.length === 0) return transcript;
-  return `${transcript}\n\nAVAILABLE TOOLS (OpenAI schema):\n${JSON.stringify(tools)}\n\nIf a tool is required, reply only with a JSON object shaped like {"name":"tool_name","arguments":{...}}. Otherwise answer normally.`;
+  return `${transcript}\n\n${describeToolProtocol(tools, nonce)}`;
 }
 
 function contentToText(content) {
@@ -507,11 +541,22 @@ function readJsonBody(request) {
   });
 }
 
+function consumeMessageToken(client) {
+  const now = Date.now();
+  const bucket = client.messageBucket;
+  bucket.tokens = Math.min(WS_MESSAGE_BURST, bucket.tokens + ((now - bucket.updatedAt) / 1000) * WS_MESSAGES_PER_SECOND);
+  bucket.updatedAt = now;
+  if (bucket.tokens < 1) return false;
+  bucket.tokens -= 1;
+  return true;
+}
+
 function createWebSocketClient(socket) {
   const client = {
     socket,
     providers: [],
     buffer: Buffer.alloc(0),
+    messageBucket: { tokens: WS_MESSAGE_BURST, updatedAt: Date.now() },
     closed: false,
     onClose: null,
     onMessage: null,

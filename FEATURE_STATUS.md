@@ -11,12 +11,15 @@ Status is evidence-based. "Verified" means an automated test or a real-browser r
 | Streaming (SSE) | Verified (test) | Streamed tool-call and title tests |
 | Conversation-title interception | Verified (test) | Title tests (opt-out via `BRIDGE_INTERCEPT_TITLES=0`) |
 | Prompt pre/post instructions | Verified (test) | `prompt-instructions.test.mjs` |
-| Text-to-`tool_calls` conversion | **Partial, best-effort** | Passes existing tests. Not safe for unattended use: see S-17 and P2. |
+| Strict tool-call protocol | Verified at protocol level (unit + HTTP) | Whole-reply block with per-request nonce, exact tool name, JSON-schema validation. **Real model replies not yet tested.** See S-17. |
 | **API-key authentication (mandatory)** | Verified (test) | Changed in P1: always required; auto-generated to `.ai-bridge-api-key` |
 | **Bridge token (WebSocket)** | Verified (test + Chromium) | Changed in P1: sent in subprotocol, never printed |
 | **CORS** | Removed (test) | No `Access-Control-*` headers; `Origin` requests refused |
 | **HTTP rate limit (`/v1/*`)** | Verified (test) | 60/min default, 429 + `Retry-After`; `/health` exempt |
 | **Response size cap** | Verified (test) | 2,000,000 characters per response; oversize returns 502 |
+| **Extension socket message limit** | Verified (test) | Burst 200, 100/s; excess closes with 1008 |
+| **Site-message policy (S-15)** | Verified (unit) | Own extension, dispatched tab, known type, bounded fields. Not yet exercised in a real AI tab. |
+| **Pre/post prompt instructions** | Default changed (test) | Off by default; visible in chat when enabled |
 | **Host / Origin checks** | Verified (test) | Loopback Host only; extension origin only on WebSocket |
 | Chrome MV3 extension connects and round-trips | Verified (headless Chromium, Linux) | `tools/e2e/extension-roundtrip.cjs` |
 | Microsoft Edge extension | **Not verified** | Not run |

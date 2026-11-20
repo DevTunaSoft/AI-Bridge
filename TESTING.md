@@ -4,9 +4,9 @@
 
 | Layer | What it proves | How to run | Status |
 |-------|----------------|-----------|--------|
-| Unit | Tool-call parsing, prompt instructions, name matching | `npm test` (files `test/tool-calls.test.mjs`, `test/prompt-instructions.test.mjs`) | 20/20 passing (pre-existing) |
-| Integration (server, protocol level) | HTTP/WebSocket contracts, auth, Host/Origin, CORS, token handling, startup validation, rate limit, response cap | `npm test` (`test/local-server.test.mjs`, `test/security.test.mjs`) | 30/30 total passing with the P1 change set |
-| Real browser (Chromium, extension loaded) | Unpacked MV3 extension connects with the subprotocol token and completes a round trip | `node tools/e2e/extension-roundtrip.cjs` (needs Playwright with a Chromium channel that supports extensions) | Passing on Linux headless Chromium, 2 consecutive runs |
+| Unit | Strict tool-call protocol, schema validation, prompt instructions, site-message policy | `npm test` (`test/tool-calls.test.mjs`, `test/prompt-instructions.test.mjs`, `test/site-message-policy.test.mjs`) | Passing (included in 43/43) |
+| Integration (server, protocol level) | HTTP/WebSocket contracts, auth, Host/Origin, CORS, token handling, startup validation, rate limits, response cap, strict tool replies, transcript pairing | `npm test` (`test/local-server.test.mjs`, `test/security.test.mjs`) | Passing (included in 43/43) |
+| Real browser (Chromium, extension loaded) | Unpacked MV3 extension connects with the subprotocol token and completes a round trip | `node tools/e2e/extension-roundtrip.cjs` (needs Playwright with a Chromium channel that supports extensions) | Passing on Linux headless Chromium (3 runs, latest after the ES-module background change) |
 | Real AI chat tabs (ChatGPT, Claude, etc.) | Composer insertion, Send, response extraction | Not run | **Not verified** |
 | Windows 11 / Edge | Install, start, extension load, OpenCode | Not run | **Not verified** |
 
@@ -47,3 +47,14 @@ The 502 is expected: no AI chat tab was open, so the extension answered with its
 npm test
 node tools/e2e/extension-roundtrip.cjs
 ```
+
+## Third increment: strict tool protocol, site-message policy, flood limit
+
+- `npm test`: **43/43 pass** (`# tests 43 / # pass 43 / # fail 0`).
+- Strict tool protocol: 15 unit tests in `test/tool-calls.test.mjs`, plus `fails closed over HTTP…` and `rejects a tool result that does not pair…` in `test/local-server.test.mjs`. The server test replays three replies through a real WebSocket client: bare JSON becomes plain text (200), a forged-nonce block returns 502, and an unoffered tool returns 502.
+- Site-message policy: 5 unit tests in `test/site-message-policy.test.mjs`. Not yet exercised in a real AI chat tab.
+- Flood limit: `an extension socket that floods messages is disconnected…` (400 pings, expects close code 1008). The red run for this test was **not** done separately before the change.
+- Real-browser check after the background script became an ES module: passes.
+- **Real model reply: not yet tested.** The next Windows test is a tool-call request against DeepSeek or Claude in the user's own browser.
+
+Test-authoring note: one of my schema tests first failed because its regular expression accepted `../etc`. I fixed the test pattern (it requires a leading letter), not the validator.
