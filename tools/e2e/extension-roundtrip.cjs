@@ -32,6 +32,18 @@ server.stdout.on("data", (chunk) => { serverLog += chunk; });
 server.stderr.on("data", (chunk) => { serverLog += chunk; });
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Waits for the AI Bridge extension's own service worker. If it never appears, the error lists every
+// worker and page seen, so a failing run shows what actually loaded.
+async function extensionWorker(context) {
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline) {
+    const found = context.serviceWorkers().find((item) => item.url().startsWith("chrome-extension://"));
+    if (found) return found;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error(`AI Bridge service worker not found. Workers: ${JSON.stringify(context.serviceWorkers().map((w) => w.url()))}. Pages: ${JSON.stringify(context.pages().map((p) => p.url()))}`);
+}
 async function waitUntil(label, predicate, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -56,8 +68,7 @@ async function waitUntil(label, predicate, timeoutMs) {
     ],
   });
   try {
-    let [worker] = context.serviceWorkers();
-    if (!worker) worker = await context.waitForEvent("serviceworker", { timeout: 15_000 });
+    const worker = await extensionWorker(context);
     results.extensionLoaded = worker.url().startsWith("chrome-extension://");
 
     await worker.evaluate((settings) => chrome.storage.local.set(settings), {
