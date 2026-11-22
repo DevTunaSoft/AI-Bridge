@@ -27,8 +27,24 @@ const SITE_CONFIG = {
     output: [".ds-markdown", "[class*='message-content']", ".markdown-body"],
   },
   perplexity: {
-    input: ["textarea", "[contenteditable='true'][role='textbox']", "[contenteditable='true']"],
-    output: ["[class*='answer'] .prose", "[class*='prose']", "[data-testid*='answer']"],
+    input: [
+      "textarea[placeholder*='Ask' i]",
+      "textarea",
+      "[contenteditable='true'][role='textbox']",
+      "[contenteditable='true']",
+    ],
+    output: [
+      "[class*='answer'] .prose",
+      "[class*='prose']",
+      "[data-testid*='answer']",
+      "[class*='markdown']",
+    ],
+    send: [
+      "button[aria-label*='Submit' i]",
+      "button[aria-label*='Send' i]",
+      "button[data-testid*='send' i]",
+      "button[type='submit']",
+    ],
   },
   qwen: {
     input: ["textarea", "[contenteditable='true'][role='textbox']", "[contenteditable='true']"],
@@ -71,12 +87,14 @@ async function runRequest({ id, prompt }) {
   runningRequest = id;
   try {
     const config = SITE_CONFIG[PROVIDER];
+    const blocked = detectBlockingMessage();
+    if (blocked) throw new Error(blocked);
     const previousText = latestResponseText(config);
     const composer = findVisible(config.input);
-    if (!composer) throw new Error("Could not find the chat composer. Make sure the page is fully loaded and you are signed in.");
+    if (!composer) throw new Error("Could not find the Perplexity chat composer. Make sure the page is fully loaded and you are signed in.");
     setComposerText(composer, resolvePromptModelName(prompt));
     await delay(80);
-    if (!clickSendButton()) {
+    if (!clickSendButton(config)) {
       composer.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true, cancelable: true }));
       composer.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true, cancelable: true }));
     }
@@ -111,15 +129,35 @@ function setComposerText(element, text) {
   element.dispatchEvent(new Event("change", { bubbles: true }));
 }
 
-function clickSendButton() {
-  const candidates = document.querySelectorAll([
-    "button[aria-label*='Send' i]", "button[aria-label*='Submit' i]", "button[aria-label*='发送']",
-    "button[data-testid*='send' i]", "button[class*='send' i]",
-  ].join(","));
+function clickSendButton(config = {}) {
+  const selectors = Array.isArray(config.send) && config.send.length
+    ? config.send
+    : [
+        "button[aria-label*='Send' i]",
+        "button[aria-label*='Submit' i]",
+        "button[aria-label*='发送']",
+        "button[data-testid*='send' i]",
+        "button[class*='send' i]",
+      ];
+  const candidates = document.querySelectorAll(selectors.join(","));
   const button = [...candidates].find((item) => isVisible(item) && !item.disabled && item.getAttribute("aria-disabled") !== "true");
   if (!button) return false;
   button.click();
   return true;
+}
+
+function detectBlockingMessage() {
+  const text = (document.body?.innerText || "").toLowerCase();
+  if (text.includes("rate limit") || text.includes("too many requests") || text.includes("try again later")) {
+    return "Perplexity rate-limited the request. Wait and retry.";
+  }
+  if (text.includes("sign in") && !findVisible(SITE_CONFIG.perplexity?.input ?? [])) {
+    return "Perplexity requires sign-in before it can answer bridge requests.";
+  }
+  if (text.includes("overloaded") || text.includes("service unavailable")) {
+    return "Perplexity reported a temporary service error.";
+  }
+  return null;
 }
 
 async function streamLatestResponse(id, config, beforeText) {
@@ -131,6 +169,8 @@ async function streamLatestResponse(id, config, beforeText) {
 
   while (Date.now() - startedAt < 230_000) {
     await delay(350);
+    const blocked = detectBlockingMessage();
+    if (blocked) throw new Error(blocked);
     const generating = isGenerating();
     sawGenerating ||= generating;
     const current = latestResponseText(config);
