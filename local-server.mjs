@@ -11,11 +11,26 @@ import {
   buildPromptWithInstructions,
   ensurePromptInstructionsLayout,
 } from "./prompt-instructions.mjs";
-import { makeAssistantMessage } from "./tool-calls.mjs";
+import {
+  ToolProtocolError,
+  assertOfferedTools,
+  createCallNonce,
+  describeToolProtocol,
+  makeAssistantMessage,
+  validateToolTranscript,
+} from "./tool-calls.mjs";
 
 const MAX_BODY_BYTES = 1_000_000;
 const MAX_QUEUE_LENGTH = 10;
 const REQUEST_TIMEOUT_MS = 240_000;
+const MIN_SECRET_LENGTH = 16;
+const WS_PROTOCOL = "ai-bridge.v1";
+const WS_TOKEN_PROTOCOL_PREFIX = "ai-bridge.token.";
+const EXTENSION_ORIGIN_PATTERN = /^(?:chrome|moz)-extension:\/\/[a-z0-9]+\/?$/i;
+const MAX_RESPONSE_CHARS = 2_000_000;
+const WS_MESSAGE_BURST = 200;
+const WS_MESSAGES_PER_SECOND = 100;
+const RESPONSE_TOO_LARGE_MESSAGE = "The web chat response exceeded the bridge size limit.";
 const PROVIDERS = ["auto", "grok", "gemini", "deepseek", "perplexity", "qwen", "chatgpt", "claude", "zai", "kimi"];
 if (PROVIDERS.slice(1).some((provider) => !PROVIDER_DISPLAY_NAMES[provider])) {
   throw new Error("PROVIDER_DISPLAY_NAMES is missing a provider from PROVIDERS.");
@@ -27,11 +42,15 @@ const DEFAULT_BRIDGE_SETTINGS = Object.freeze({
 
 const args = parseArgs(process.argv.slice(2));
 const port = readPort(args.port ?? process.env.BRIDGE_PORT ?? "4317");
+const allowedHostHeaders = new Set(["127.0.0.1", "localhost", "[::1]"].flatMap((host) => [host, `${host}:${port}`]));
 const tokenConfig = resolveBridgeToken(args);
 const settingsConfig = loadBridgeSettings(args);
 const promptInstructionsDir = resolvePromptInstructionsDirectory(args, settingsConfig.path);
-const bridgeToken = tokenConfig.token;
-const apiKey = args.apiKey ?? process.env.BRIDGE_API_KEY ?? "";
+const bridgeToken = tokenConfig.value;
+const apiKeyConfig = resolveApiKey(args);
+const apiKey = apiKeyConfig.value;
+const rateLimitPerMinute = readPositiveInteger(args["rate-limit-per-minute"] ?? process.env.BRIDGE_RATE_LIMIT_PER_MINUTE ?? "60", "Rate limit per minute");
+const rateBucket = { tokens: rateLimitPerMinute, updatedAt: Date.now() };
 const interceptTitleRequests = process.env.BRIDGE_INTERCEPT_TITLES === undefined
   ? settingsConfig.settings.interceptTitleRequests
   : process.env.BRIDGE_INTERCEPT_TITLES !== "0";
@@ -50,14 +69,23 @@ const server = http.createServer(async (request, response) => {
     if (!isLoopback(request.socket.remoteAddress)) {
       return sendOpenAiError(response, 403, "AI Bridge only accepts loopback connections.", "forbidden");
     }
-
-    setCorsHeaders(response);
+    if (!allowedHostHeaders.has(String(request.headers.host ?? "").toLowerCase())) {
+      return sendOpenAiError(response, 403, "AI Bridge only accepts requests addressed to a loopback Host.", "forbidden");
+    }
+    // Browser pages always send Origin. The API has no browser clients, so every request carrying
+    // Origin is refused and no CORS grant is ever sent; hostile pages cannot drive the chat tab.
+    if (request.headers.origin !== undefined) {
+      return sendOpenAiError(response, 403, "Browser-origin requests are not accepted by AI Bridge.", "forbidden");
+    }
     if (request.method === "OPTIONS") {
-      response.writeHead(204).end();
-      return;
+      return sendOpenAiError(response, 405, "CORS preflight is not supported.", "method_not_allowed");
     }
 
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
+    if (url.pathname.startsWith("/v1/") && !consumeRateToken()) {
+      response.setHeader("Retry-After", String(Math.ceil(60 / rateLimitPerMinute)));
+      return sendOpenAiError(response, 429, "AI Bridge rate limit reached. Try again shortly.", "rate_limit_error");
+    }
     if (request.method === "GET" && url.pathname === "/health") {
       return sendJson(response, 200, {
         ok: true,
@@ -97,10 +125,18 @@ const server = http.createServer(async (request, response) => {
 server.on("upgrade", (request, socket, head) => {
   try {
     if (!isLoopback(request.socket.remoteAddress)) return rejectUpgrade(socket, 403, "Loopback only");
+    if (!allowedHostHeaders.has(String(request.headers.host ?? "").toLowerCase())) return rejectUpgrade(socket, 403, "Forbidden host");
+    if (request.headers.origin !== undefined && !EXTENSION_ORIGIN_PATTERN.test(String(request.headers.origin))) {
+      return rejectUpgrade(socket, 403, "Forbidden origin");
+    }
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
     if (url.pathname !== "/bridge") return rejectUpgrade(socket, 404, "Not found");
-    if (url.searchParams.get("token") !== bridgeToken) return rejectUpgrade(socket, 401, "Invalid bridge token");
     if (request.headers.upgrade?.toLowerCase() !== "websocket") return rejectUpgrade(socket, 400, "WebSocket required");
+
+    // The token travels in Sec-WebSocket-Protocol, never in the URL, so it is not written to URL logs.
+    const offered = parseOfferedProtocols(request.headers["sec-websocket-protocol"]);
+    const presentedToken = offered.find((protocol) => protocol.startsWith(WS_TOKEN_PROTOCOL_PREFIX))?.slice(WS_TOKEN_PROTOCOL_PREFIX.length) ?? "";
+    if (!offered.includes(WS_PROTOCOL) || !safeEqual(presentedToken, bridgeToken)) return rejectUpgrade(socket, 401, "Invalid bridge token");
 
     const key = request.headers["sec-websocket-key"];
     if (typeof key !== "string") return rejectUpgrade(socket, 400, "Missing WebSocket key");
@@ -110,6 +146,7 @@ server.on("upgrade", (request, socket, head) => {
       "Upgrade: websocket",
       "Connection: Upgrade",
       `Sec-WebSocket-Accept: ${accept}`,
+      `Sec-WebSocket-Protocol: ${WS_PROTOCOL}`,
       "",
       "",
     ].join("\r\n"));
@@ -124,7 +161,11 @@ server.on("upgrade", (request, socket, head) => {
       log(`Chrome extension disconnected (${clients.size} active).`);
       failJobsForClient(client, "The Chrome extension disconnected while the request was running.");
     };
-    client.onMessage = (message) => handleExtensionMessage(client, message);
+    client.onMessage = (message) => {
+      // A flooding client gets disconnected rather than being allowed to exhaust the event loop.
+      if (!consumeMessageToken(client)) return closeWebSocket(client, 1008, "Too many messages");
+      handleExtensionMessage(client, message);
+    };
   } catch {
     socket.destroy();
   }
@@ -133,12 +174,15 @@ server.on("upgrade", (request, socket, head) => {
 server.listen(port, "127.0.0.1", () => {
   log(`AI Bridge listening at http://127.0.0.1:${port}`);
   log(`Extension WebSocket: ws://127.0.0.1:${port}/bridge`);
-  log(`Bridge token: ${bridgeToken}`);
-  if (tokenConfig.path) log(`Bridge token file: ${tokenConfig.path}`);
+  // Secret values are never written to logs; only where they are stored.
+  log(tokenConfig.path
+    ? `Bridge token file: ${tokenConfig.path} (open it to copy the token into the extension; the value is not printed)`
+    : "Bridge token supplied by --token or BRIDGE_TOKEN (the value is not printed).");
+  log(apiKeyConfig.path
+    ? `API key file: ${apiKeyConfig.path} (the value is not printed)`
+    : "API key supplied by --api-key or BRIDGE_API_KEY (the value is not printed).");
   log(`Settings file: ${settingsConfig.path}`);
   log(`Prompt instructions: ${promptInstructionsDir}`);
-  if (!apiKey) log("API key authentication is disabled (loopback-only mode).");
-  else log("API key authentication is enabled.");
 });
 
 function handleChatCompletion(request, response, payload) {
@@ -151,6 +195,14 @@ function handleChatCompletion(request, response, payload) {
   if (interceptTitleRequests && isConversationTitleRequest(payload.messages)) {
     return sendConversationTitle(response, payload);
   }
+  const tools = Array.isArray(payload.tools) ? payload.tools : [];
+  try {
+    if (tools.length > 0) assertOfferedTools(tools);
+    validateToolTranscript(payload.messages);
+  } catch (error) {
+    if (error instanceof ToolProtocolError) return sendOpenAiError(response, 400, error.message, "invalid_request_error", "tools");
+    throw error;
+  }
   if (clients.size === 0) {
     return sendOpenAiError(response, 503, "No Chrome extension is connected. Start the local server, then configure and enable the extension.", "bridge_unavailable");
   }
@@ -159,9 +211,9 @@ function handleChatCompletion(request, response, payload) {
   }
 
   const provider = providerForModel(payload.model);
-  const tools = Array.isArray(payload.tools) ? payload.tools : [];
+  const nonce = tools.length > 0 ? createCallNonce() : null;
   const prompt = buildPromptWithInstructions(
-    formatPrompt(payload.messages, tools),
+    formatPrompt(payload.messages, tools, nonce),
     payload.messages,
     provider,
     {
@@ -178,6 +230,7 @@ function handleChatCompletion(request, response, payload) {
     provider,
     prompt,
     tools,
+    nonce,
     hasTools: tools.length > 0,
     stream: payload.stream === true,
     streamedContent: false,
@@ -292,6 +345,7 @@ function handleExtensionMessage(client, message) {
   if (message.type === "bridge:chunk") {
     const text = typeof message.text === "string" ? message.text : "";
     if (!text) return;
+    if (job.text.length + text.length > MAX_RESPONSE_CHARS) return finishJobWithError(job, RESPONSE_TOO_LARGE_MESSAGE);
     job.text += text;
     // When tools are present, buffer until complete so we can lift JSON into tool_calls
     // instead of streaming it as ordinary assistant content the IDE will ignore.
@@ -300,6 +354,7 @@ function handleExtensionMessage(client, message) {
   }
   if (message.type === "bridge:complete") {
     if (typeof message.text === "string" && message.text) {
+      if (message.text.length > MAX_RESPONSE_CHARS) return finishJobWithError(job, RESPONSE_TOO_LARGE_MESSAGE);
       if (!job.text || message.text.length >= job.text.length) job.text = message.text;
     }
     finishJob(job);
@@ -312,15 +367,22 @@ function handleExtensionMessage(client, message) {
 
 function finishJob(job) {
   if (job.done) return;
+  // Parse before marking the job done: a rejected reply must reach finishJobWithError, which needs the job open.
+  let message;
+  try {
+    message = makeAssistantMessage(job.text, { tools: job.tools, nonce: job.nonce });
+  } catch (error) {
+    const reason = error instanceof ToolProtocolError ? error.message : "unexpected parser error";
+    return finishJobWithError(job, `The model's tool reply was rejected (${reason}).`);
+  }
   job.done = true;
   clearTimeout(job.timer);
   jobs.delete(job.id);
   if (activeJob === job) activeJob = null;
 
   if (job.stream) {
-    finishStreamingJob(job);
+    finishStreamingJob(job, message);
   } else {
-    const message = makeAssistantMessage(job.text, job.tools);
     sendJson(job.response, 200, {
       id: `chatcmpl-${crypto.randomUUID()}`,
       object: "chat.completion",
@@ -332,24 +394,21 @@ function finishJob(job) {
   dispatchNext();
 }
 
-function finishStreamingJob(job) {
-  if (job.hasTools) {
-    const message = makeAssistantMessage(job.text, job.tools);
-    if (message.tool_calls) {
-      const call = message.tool_calls[0];
-      writeSse(job.response, makeStreamChunk(job, {
-        tool_calls: [{
-          index: 0,
-          id: call.id,
-          type: "function",
-          function: { name: call.function.name, arguments: call.function.arguments },
-        }],
-      }, null));
-      writeSse(job.response, makeStreamChunk(job, {}, "tool_calls"));
-      writeSse(job.response, "[DONE]");
-      job.response.end();
-      return;
-    }
+function finishStreamingJob(job, message) {
+  if (message.tool_calls) {
+    const call = message.tool_calls[0];
+    writeSse(job.response, makeStreamChunk(job, {
+      tool_calls: [{
+        index: 0,
+        id: call.id,
+        type: "function",
+        function: { name: call.function.name, arguments: call.function.arguments },
+      }],
+    }, null));
+    writeSse(job.response, makeStreamChunk(job, {}, "tool_calls"));
+    writeSse(job.response, "[DONE]");
+    job.response.end();
+    return;
   }
 
   if (!job.streamedContent && job.text) writeChunk(job, job.text);
@@ -410,13 +469,21 @@ function makeStreamChunk(job, delta, finishReason) {
   };
 }
 
-function formatPrompt(messages, tools) {
+function formatPrompt(messages, tools, nonce) {
   const transcript = messages.map((message) => {
+    if (message.role === "tool") {
+      return `TOOL RESULT (tool_call_id=${message.tool_call_id}):\n${contentToText(message.content)}`;
+    }
     const role = typeof message.role === "string" ? message.role.toUpperCase() : "USER";
-    return `${role}:\n${contentToText(message.content)}`;
+    const calls = (Array.isArray(message.tool_calls) ? message.tool_calls : []).map((call) => {
+      const args = typeof call?.function?.arguments === "string" ? call.function.arguments : JSON.stringify(call?.function?.arguments ?? {});
+      return `[tool call id=${call?.id} name=${call?.function?.name ?? ""}] arguments: ${args}`;
+    });
+    const body = [contentToText(message.content), ...calls].filter((part) => part !== "").join("\n");
+    return `${role}:\n${body}`;
   }).join("\n\n");
   if (!Array.isArray(tools) || tools.length === 0) return transcript;
-  return `${transcript}\n\nAVAILABLE TOOLS (OpenAI schema):\n${JSON.stringify(tools)}\n\nIf a tool is required, reply only with a JSON object shaped like {"name":"tool_name","arguments":{...}}. Otherwise answer normally.`;
+  return `${transcript}\n\n${describeToolProtocol(tools, nonce)}`;
 }
 
 function contentToText(content) {
@@ -474,11 +541,22 @@ function readJsonBody(request) {
   });
 }
 
+function consumeMessageToken(client) {
+  const now = Date.now();
+  const bucket = client.messageBucket;
+  bucket.tokens = Math.min(WS_MESSAGE_BURST, bucket.tokens + ((now - bucket.updatedAt) / 1000) * WS_MESSAGES_PER_SECOND);
+  bucket.updatedAt = now;
+  if (bucket.tokens < 1) return false;
+  bucket.tokens -= 1;
+  return true;
+}
+
 function createWebSocketClient(socket) {
   const client = {
     socket,
     providers: [],
     buffer: Buffer.alloc(0),
+    messageBucket: { tokens: WS_MESSAGE_BURST, updatedAt: Date.now() },
     closed: false,
     onClose: null,
     onMessage: null,
@@ -574,18 +652,40 @@ function rejectUpgrade(socket, status, message) {
 }
 
 function isAuthorized(request) {
-  if (!apiKey) return true;
-  return request.headers.authorization === `Bearer ${apiKey}`;
+  const match = /^Bearer\s+(\S+)$/i.exec(String(request.headers.authorization ?? ""));
+  return match !== null && safeEqual(match[1], apiKey);
+}
+
+// Token bucket for /v1/* requests: capacity and refill are both rateLimitPerMinute per minute.
+function consumeRateToken() {
+  const now = Date.now();
+  const refill = ((now - rateBucket.updatedAt) / 60_000) * rateLimitPerMinute;
+  rateBucket.tokens = Math.min(rateLimitPerMinute, rateBucket.tokens + refill);
+  rateBucket.updatedAt = now;
+  if (rateBucket.tokens < 1) return false;
+  rateBucket.tokens -= 1;
+  return true;
+}
+
+function readPositiveInteger(value, label) {
+  const parsed = Number.parseInt(String(value), 10);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 10_000) throw new Error(`${label} must be an integer between 1 and 10000.`);
+  return parsed;
+}
+
+function safeEqual(candidate, expected) {
+  const left = Buffer.from(String(candidate), "utf8");
+  const right = Buffer.from(String(expected), "utf8");
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
+function parseOfferedProtocols(value) {
+  if (typeof value !== "string") return [];
+  return value.split(",").map((item) => item.trim()).filter(Boolean);
 }
 
 function isLoopback(address) {
   return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
-}
-
-function setCorsHeaders(response) {
-  response.setHeader("Access-Control-Allow-Origin", "*");
-  response.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
-  response.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
 }
 
 function sendJson(response, status, payload) {
@@ -620,24 +720,50 @@ function readPort(value) {
 }
 
 function resolveBridgeToken(options) {
-  const supplied = options.token ?? process.env.BRIDGE_TOKEN;
-  if (supplied) return { token: supplied, path: null };
-
   const serverDirectory = path.dirname(fileURLToPath(import.meta.url));
-  const tokenPath = path.resolve(options.tokenFile ?? options["token-file"] ?? process.env.BRIDGE_TOKEN_FILE ?? path.join(serverDirectory, ".ai-bridge-token"));
-  const existing = readTokenFile(tokenPath);
-  if (existing) return { token: existing, path: tokenPath };
+  return resolveSecret({
+    label: "Bridge token",
+    supplied: options.token ?? process.env.BRIDGE_TOKEN,
+    filePath: options.tokenFile ?? options["token-file"] ?? process.env.BRIDGE_TOKEN_FILE ?? path.join(serverDirectory, ".ai-bridge-token"),
+  });
+}
+
+function resolveApiKey(options) {
+  const serverDirectory = path.dirname(fileURLToPath(import.meta.url));
+  return resolveSecret({
+    label: "API key",
+    supplied: options["api-key"] ?? process.env.BRIDGE_API_KEY,
+    filePath: options.apiKeyFile ?? options["api-key-file"] ?? process.env.BRIDGE_API_KEY_FILE ?? path.join(serverDirectory, ".ai-bridge-api-key"),
+  });
+}
+
+// Supplied secrets are validated; otherwise a strong secret is generated once into a 0600 file.
+// The returned value is never logged by callers.
+function resolveSecret({ label, supplied, filePath }) {
+  if (supplied) return { value: validateSecret(supplied, label), path: null };
+
+  const secretPath = path.resolve(filePath);
+  const existing = readTokenFile(secretPath);
+  if (existing) return { value: validateSecret(existing, label), path: secretPath };
 
   const generated = crypto.randomBytes(24).toString("base64url");
   try {
-    fs.writeFileSync(tokenPath, `${generated}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
-    return { token: generated, path: tokenPath };
+    fs.writeFileSync(secretPath, `${generated}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    return { value: generated, path: secretPath };
   } catch (error) {
-    if (error?.code !== "EEXIST") throw new Error(`Could not create bridge token file at ${tokenPath}: ${error.message}`);
-    const tokenCreatedElsewhere = readTokenFile(tokenPath);
-    if (tokenCreatedElsewhere) return { token: tokenCreatedElsewhere, path: tokenPath };
-    throw new Error(`Bridge token file at ${tokenPath} is empty.`);
+    if (error?.code !== "EEXIST") throw new Error(`Could not create ${label.toLowerCase()} file at ${secretPath}: ${error.message}`);
+    const createdElsewhere = readTokenFile(secretPath);
+    if (createdElsewhere) return { value: validateSecret(createdElsewhere, label), path: secretPath };
+    throw new Error(`${label} file at ${secretPath} is empty.`);
   }
+}
+
+function validateSecret(value, label) {
+  const trimmed = String(value).trim();
+  if (trimmed.length < MIN_SECRET_LENGTH || !/^[A-Za-z0-9._~-]+$/.test(trimmed)) {
+    throw new Error(`${label} must be at least 16 characters and use only letters, digits, '.', '_', '~' or '-'.`);
+  }
+  return trimmed;
 }
 
 function loadBridgeSettings(options) {

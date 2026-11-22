@@ -15,8 +15,9 @@ export const PROVIDER_DISPLAY_NAMES = Object.freeze({
 
 export const DEFAULT_PROMPT_INSTRUCTION_SETTINGS = Object.freeze({
   injectPromptInstructionsEveryMessage: true,
-  prePrompt: "Generic Pre-prompt",
-  postPrompt: "Generic Post-prompt",
+  // Off by default: the pre/post text is typed into the visible chat. Set names to opt in.
+  prePrompt: "",
+  postPrompt: "",
   // Turning on may increase responsiveness of a model to the prompt.
   disguiseModelNameAsAssistant: false,
 });

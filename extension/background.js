@@ -18,6 +18,13 @@ const DEFAULT_SETTINGS = {
 };
 
 const HEARTBEAT_INTERVAL_MS = 20_000;
+// Must match local-server.mjs. The token is sent as a subprotocol, never in the URL.
+import { acceptSiteMessage } from "./site-message-policy.js";
+
+// Job id -> tab id the server's job was dispatched to. Site messages must come from that tab.
+const jobTabs = new Map();
+const WS_PROTOCOL = "ai-bridge.v1";
+const WS_TOKEN_PROTOCOL_PREFIX = "ai-bridge.token.";
 let socket = null;
 let reconnectTimer = null;
 let heartbeatTimer = null;
@@ -25,9 +32,9 @@ let socketState = "disconnected";
 let lastError = "";
 let closingForPause = false;
 
-chrome.runtime.onInstalled.addListener(async () => {
-  const existing = await chrome.storage.local.get(DEFAULT_SETTINGS);
-  await chrome.storage.local.set(existing);
+chrome.runtime.onInstalled.addListener(() => {
+  // Defaults are applied on every read via DEFAULT_SETTINGS, so nothing is written here. Writing
+  // defaults back on install raced with settings the user had just saved and could erase them.
   connect();
 });
 
@@ -64,8 +71,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message?.type === "bridge:site-message") {
-    const provider = providerForUrl(sender.tab?.url);
-    sendToServer({ ...message.message, provider });
+    const accepted = acceptSiteMessage(message.message, {
+      senderId: sender.id,
+      runtimeId: chrome.runtime.id,
+      senderTabId: sender.tab?.id,
+      jobTabs,
+    });
+    if (!accepted) return;
+    if (accepted.type !== "bridge:chunk") jobTabs.delete(accepted.id);
+    sendToServer(accepted);
   }
 });
 
@@ -94,12 +108,12 @@ async function connect(force = false) {
     updateBadge();
     return;
   }
-  const endpoint = toWebSocketUrl(settings.serverUrl, settings.token);
+  const endpoint = toWebSocketUrl(settings.serverUrl);
   socketState = "connecting";
   lastError = "";
   updateBadge();
   try {
-    socket = new WebSocket(endpoint);
+    socket = new WebSocket(endpoint, [WS_PROTOCOL, `${WS_TOKEN_PROTOCOL_PREFIX}${settings.token.trim()}`]);
   } catch (error) {
     scheduleReconnect(error.message);
     return;
@@ -181,10 +195,12 @@ async function handleServerMessage(message) {
     return;
   }
   try {
+    jobTabs.set(message.id, tab.id);
     await chrome.tabs.sendMessage(tab.id, { type: "bridge:run", id: message.id, prompt: message.prompt });
     await chrome.tabs.update(tab.id, { active: true });
     await chrome.windows.update(tab.windowId, { focused: true });
   } catch {
+    jobTabs.delete(message.id);
     sendToServer({ type: "bridge:error", id: message.id, message: "The AI Bridge content script is not ready in the selected tab. Reload that tab and retry." });
   }
 }
@@ -202,12 +218,12 @@ function sendToServer(message) {
   if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
 }
 
-function toWebSocketUrl(serverUrl, token) {
+function toWebSocketUrl(serverUrl) {
   const url = new URL(serverUrl.trim());
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   url.pathname = "/bridge";
   url.search = "";
-  url.searchParams.set("token", token.trim());
+  url.hash = "";
   return url.toString();
 }
 
@@ -221,11 +237,6 @@ async function openProvider(provider) {
     return;
   }
   await chrome.tabs.create({ url: item.home, active: true });
-}
-
-function providerForUrl(url) {
-  if (!url) return null;
-  return Object.entries(PROVIDERS).find(([, item]) => item.matches.some((pattern) => url.startsWith(pattern.replace("*", ""))))?.[0] ?? null;
 }
 
 async function getState() {

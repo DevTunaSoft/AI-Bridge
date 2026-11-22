@@ -1,124 +1,170 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  extractToolCall,
+  ToolProtocolError,
+  assertOfferedTools,
+  createCallNonce,
+  describeToolProtocol,
   makeAssistantMessage,
   normalizeToolArguments,
+  parseToolReply,
   toolNamesFromTools,
+  validateToolTranscript,
 } from "../tool-calls.mjs";
 
+const NONCE = "nonce-abc_123";
+const block = (body, nonce = NONCE) => `<<AIB:CALL:${nonce}>>\n${body}\n<<AIB:END:${nonce}>>`;
+
 const bashTools = [
-  { type: "function", function: { name: "Bash", parameters: { type: "object" } } },
+  {
+    type: "function",
+    function: {
+      name: "Bash",
+      parameters: {
+        type: "object",
+        properties: {
+          command: { type: "string", minLength: 1 },
+          description: { type: "string" },
+        },
+        required: ["command"],
+        additionalProperties: false,
+      },
+    },
+  },
 ];
 
 const multiTools = [
-  { type: "function", function: { name: "Bash", parameters: { type: "object" } } },
-  { type: "function", function: { name: "Read", parameters: { type: "object" } } },
-  { name: "Write", parameters: { type: "object" } },
+  ...bashTools,
+  { type: "function", function: { name: "Read", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } } },
 ];
 
 test("parses OpenAI and legacy tool request schemas for offered names", () => {
   assert.deepEqual(toolNamesFromTools(bashTools), ["Bash"]);
-  assert.deepEqual(toolNamesFromTools(multiTools), ["Bash", "Read", "Write"]);
+  assert.deepEqual(toolNamesFromTools([{ name: "Write", parameters: { type: "object" } }]), ["Write"]);
   assert.deepEqual(toolNamesFromTools(null), []);
-  assert.deepEqual(toolNamesFromTools([{ type: "function", function: {} }]), []);
 });
 
-test("extracts bare JSON tool calls matching the request tools", () => {
-  const raw = "{\"name\":\"Bash\",\"arguments\":{\"command\":\"ls -la\",\"description\":\"List files in current directory\"}}";
-  assert.deepEqual(extractToolCall(raw, bashTools), {
-    name: "Bash",
-    arguments: { command: "ls -la", description: "List files in current directory" },
-  });
-});
-
-test("extracts fenced and prose-wrapped tool calls", () => {
-  const fenced = "Sure.\n\n```json\n{\"name\":\"Bash\",\"arguments\":{\"command\":\"pwd\"}}\n```\n";
-  assert.equal(extractToolCall(fenced, bashTools)?.name, "Bash");
-  assert.deepEqual(extractToolCall(fenced, bashTools)?.arguments, { command: "pwd" });
-
-  const jsFence = "```javascript\n{\"name\":\"Read\",\"arguments\":{\"path\":\"README.md\"}}\n```";
-  assert.equal(extractToolCall(jsFence, multiTools)?.name, "Read");
-
-  const prose = "Let me check that.\n{\"name\":\"Bash\",\"arguments\":{\"command\":\"pwd\"}}\nDone.";
-  assert.equal(extractToolCall(prose, bashTools)?.arguments.command, "pwd");
-});
-
-test("extracts nested-object arguments and pre-stringified argument fields", () => {
-  const nested = "{\"name\":\"Write\",\"arguments\":{\"path\":\"a.txt\",\"contents\":{\"ok\":true,\"items\":[1,2]}}}";
-  assert.deepEqual(extractToolCall(nested, multiTools)?.arguments, {
-    path: "a.txt",
-    contents: { ok: true, items: [1, 2] },
-  });
-
-  const stringArgs = "{\"name\":\"Bash\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}";
-  assert.equal(extractToolCall(stringArgs, bashTools)?.arguments, "{\"command\":\"ls\"}");
-  assert.equal(
-    normalizeToolArguments(extractToolCall(stringArgs, bashTools).arguments),
-    "{\"command\":\"ls\"}",
+test("accepts exactly one whole-reply block that matches an offered tool", () => {
+  assert.deepEqual(
+    parseToolReply(block("{\"name\":\"Bash\",\"arguments\":{\"command\":\"ls -la\"}}"), { nonce: NONCE, tools: bashTools }),
+    { name: "Bash", arguments: { command: "ls -la" } },
   );
 });
 
-test("prefers a valid offered tool when multiple JSON objects appear", () => {
-  const mixed = [
-    "Notes: {\"ok\":true}",
-    "{\"name\":\"NotATool\",\"arguments\":{}}",
-    "{\"name\":\"Read\",\"arguments\":{\"path\":\"local-server.mjs\"}}",
-  ].join("\n");
-  assert.deepEqual(extractToolCall(mixed, multiTools), {
-    name: "Read",
-    arguments: { path: "local-server.mjs" },
-  });
+test("treats bare, fenced and prose-wrapped JSON as plain text, never as a tool call", () => {
+  const bare = "{\"name\":\"Bash\",\"arguments\":{\"command\":\"rm -rf /\"}}";
+  const fenced = "```json\n{\"name\":\"Bash\",\"arguments\":{\"command\":\"ls\"}}\n```";
+  const prose = "Let me check.\n{\"name\":\"Bash\",\"arguments\":{\"command\":\"pwd\"}}\nDone.";
+  for (const reply of [bare, fenced, prose]) {
+    assert.equal(parseToolReply(reply, { nonce: NONCE, tools: bashTools }), null);
+    assert.deepEqual(makeAssistantMessage(reply, { tools: bashTools, nonce: NONCE }), { role: "assistant", content: reply });
+  }
 });
 
-test("ignores JSON that is not an offered tool or is malformed", () => {
-  const raw = "{\"name\":\"NotATool\",\"arguments\":{\"command\":\"ls\"}}";
-  assert.equal(extractToolCall(raw, bashTools), null);
-  assert.equal(extractToolCall(raw, []), null);
-  assert.equal(extractToolCall("plain answer", bashTools), null);
-  assert.equal(extractToolCall("{\"name\":\"Bash\",\"arguments\":", bashTools), null);
-  assert.equal(extractToolCall("{\"name\":1,\"arguments\":{}}", bashTools), null);
-  assert.equal(extractToolCall("{\"name\":\"Bash\",\"arguments\":false}", bashTools), null);
-  // Array-wrapped payloads still yield the inner object via balanced-brace scan.
-  assert.equal(extractToolCall("[{\"name\":\"Bash\",\"arguments\":{}}]", bashTools)?.name, "Bash");
+test("rejects a quoted block that is not the whole reply", () => {
+  const quoted = `The IDE sent this earlier: ${block("{\"name\":\"Bash\",\"arguments\":{\"command\":\"ls\"}}")} as an example.`;
+  assert.throws(() => parseToolReply(quoted, { nonce: NONCE, tools: bashTools }), ToolProtocolError);
 });
 
-test("builds OpenAI tool_calls with stringified arguments", () => {
-  const message = makeAssistantMessage(
-    "{\"name\":\"Bash\",\"arguments\":{\"command\":\"ls -la\"}}",
-    bashTools,
-  );
+test("rejects two blocks, a stray marker, and blocks carrying a different nonce", () => {
+  const one = block("{\"name\":\"Bash\",\"arguments\":{\"command\":\"ls\"}}");
+  assert.throws(() => parseToolReply(`${one}\n${one}`, { nonce: NONCE, tools: bashTools }), ToolProtocolError);
+  assert.throws(() => parseToolReply(`${one}\n<<AIB:CALL:x>>`, { nonce: NONCE, tools: bashTools }), ToolProtocolError);
+  const replayed = block("{\"name\":\"Bash\",\"arguments\":{\"command\":\"ls\"}}", "some-other-nonce");
+  assert.throws(() => parseToolReply(replayed, { nonce: NONCE, tools: bashTools }), ToolProtocolError);
+});
+
+test("rejects names that were not offered, including case-only variants", () => {
+  assert.throws(() => parseToolReply(block("{\"name\":\"Delete\",\"arguments\":{}}"), { nonce: NONCE, tools: bashTools }), /not offered/);
+  assert.throws(() => parseToolReply(block("{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}"), { nonce: NONCE, tools: bashTools }), /not offered/);
+});
+
+test("rejects arguments that violate the offered JSON schema", () => {
+  const cases = [
+    ["{\"name\":\"Bash\",\"arguments\":{}}", /is required/],
+    ["{\"name\":\"Bash\",\"arguments\":{\"command\":42}}", /must be string/],
+    ["{\"name\":\"Bash\",\"arguments\":{\"command\":\"\"}}", /shorter than 1/],
+    ["{\"name\":\"Bash\",\"arguments\":{\"command\":\"ls\",\"sudo\":true}}", /not an allowed argument/],
+    ["{\"name\":\"Bash\",\"arguments\":\"ls\"}", /must be a JSON object/],
+  ];
+  for (const [body, pattern] of cases) {
+    assert.throws(() => parseToolReply(block(body), { nonce: NONCE, tools: bashTools }), (error) => error instanceof ToolProtocolError && pattern.test(error.message), body);
+  }
+});
+
+test("rejects malformed blocks and unexpected fields", () => {
+  assert.throws(() => parseToolReply(block("{\"name\":\"Bash\""), { nonce: NONCE, tools: bashTools }), /not valid JSON/);
+  assert.throws(() => parseToolReply(block("[]"), { nonce: NONCE, tools: bashTools }), /JSON object/);
+  assert.throws(() => parseToolReply(block("{\"name\":\"Bash\",\"arguments\":{\"command\":\"ls\"},\"extra\":1}"), { nonce: NONCE, tools: bashTools }), /unexpected field/);
+});
+
+test("enforces enum, array items and nested objects in the schema", () => {
+  const tools = [{
+    name: "Edit",
+    parameters: {
+      type: "object",
+      properties: {
+        mode: { type: "string", enum: ["replace", "insert"] },
+        lines: { type: "array", items: { type: "integer", minimum: 1 } },
+        target: { type: "object", properties: { path: { type: "string", pattern: "^[a-z][a-z./-]*$" } }, required: ["path"] },
+      },
+      required: ["mode"],
+    },
+  }];
+  const good = "{\"name\":\"Edit\",\"arguments\":{\"mode\":\"insert\",\"lines\":[1,2],\"target\":{\"path\":\"src/a.js\"}}}";
+  assert.equal(parseToolReply(block(good), { nonce: NONCE, tools }).arguments.mode, "insert");
+  assert.throws(() => parseToolReply(block("{\"name\":\"Edit\",\"arguments\":{\"mode\":\"delete\"}}"), { nonce: NONCE, tools }), /allowed values/);
+  assert.throws(() => parseToolReply(block("{\"name\":\"Edit\",\"arguments\":{\"mode\":\"insert\",\"lines\":[0]}}"), { nonce: NONCE, tools }), /below 1/);
+  assert.throws(() => parseToolReply(block("{\"name\":\"Edit\",\"arguments\":{\"mode\":\"insert\",\"target\":{\"path\":\"../etc\"}}}"), { nonce: NONCE, tools }), /pattern/);
+});
+
+test("refuses tool schemas that use keywords the gateway cannot enforce", () => {
+  assert.throws(() => assertOfferedTools([{ name: "X", parameters: { type: "object", oneOf: [{}] } }]), /not supported/);
+  assert.throws(() => assertOfferedTools([{ name: "X", parameters: { type: "object", properties: { a: { $ref: "#/defs/a" } } } }]), /not supported/);
+  assert.throws(() => assertOfferedTools([{ name: "Bad Name", parameters: { type: "object" } }]), /name of/);
+  assert.throws(() => assertOfferedTools([{ name: "Dup", parameters: {} }, { name: "Dup", parameters: {} }]), /more than once/);
+});
+
+test("tool-protocol instructions carry the nonce and the exact block format", () => {
+  const text = describeToolProtocol(bashTools, NONCE);
+  assert.match(text, /<<AIB:CALL:nonce-abc_123>>/);
+  assert.match(text, /<<AIB:END:nonce-abc_123>>/);
+  assert.match(text, /"name":"Bash"/);
+});
+
+test("makes OpenAI tool_calls with stringified arguments and requires a nonce when tools are offered", () => {
+  const message = makeAssistantMessage(block("{\"name\":\"Bash\",\"arguments\":{\"command\":\"ls -la\"}}"), { tools: bashTools, nonce: NONCE });
   assert.equal(message.content, null);
-  assert.equal(message.tool_calls.length, 1);
   assert.equal(message.tool_calls[0].type, "function");
   assert.equal(message.tool_calls[0].function.name, "Bash");
-  assert.equal(typeof message.tool_calls[0].function.arguments, "string");
   assert.deepEqual(JSON.parse(message.tool_calls[0].function.arguments), { command: "ls -la" });
   assert.match(message.tool_calls[0].id, /^call_/);
+  assert.throws(() => makeAssistantMessage(block("{\"name\":\"Bash\",\"arguments\":{\"command\":\"ls\"}}"), { tools: bashTools, nonce: null }), ToolProtocolError);
+});
 
-  const plain = makeAssistantMessage("No tools needed.", bashTools);
-  assert.equal(plain.content, "No tools needed.");
-  assert.equal(plain.tool_calls, undefined);
+test("validates tool-result pairing across the transcript", () => {
+  const paired = [
+    { role: "user", content: "list" },
+    { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "Bash", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "call_1", content: "a.txt" },
+  ];
+  assert.doesNotThrow(() => validateToolTranscript(paired));
+  assert.throws(() => validateToolTranscript([{ role: "tool", tool_call_id: "call_9", content: "x" }]), /does not match/);
+  assert.throws(() => validateToolTranscript([
+    { role: "assistant", tool_calls: [{ id: "call_1" }] },
+    { role: "assistant", tool_calls: [{ id: "call_1" }] },
+  ]), /repeated/);
+});
+
+test("creates a fresh nonce for each request", () => {
+  const first = createCallNonce();
+  assert.match(first, /^[A-Za-z0-9_-]{16}$/);
+  assert.notEqual(first, createCallNonce());
 });
 
 test("normalizes object and pre-stringified arguments", () => {
   assert.equal(normalizeToolArguments({ command: "ls" }), "{\"command\":\"ls\"}");
   assert.equal(normalizeToolArguments("{\"command\":\"ls\"}"), "{\"command\":\"ls\"}");
   assert.equal(normalizeToolArguments(null), "{}");
-  assert.equal(normalizeToolArguments(undefined), "{}");
-  assert.equal(normalizeToolArguments(""), "{}");
   assert.equal(normalizeToolArguments("not-json"), "{\"value\":\"not-json\"}");
-});
-
-test("matches tool names case-insensitively to the canonical schema name", () => {
-  assert.equal(extractToolCall("{\"name\":\"bash\",\"arguments\":{}}", bashTools)?.name, "Bash");
-  assert.equal(extractToolCall("{\"name\":\"READ\",\"arguments\":{\"path\":\"x\"}}", multiTools)?.name, "Read");
-});
-
-test("accepts empty arguments objects from local IDE-style requests", () => {
-  assert.deepEqual(extractToolCall("{\"name\":\"Bash\"}", bashTools), { name: "Bash", arguments: {} });
-  assert.deepEqual(extractToolCall("{\"name\":\"Bash\",\"arguments\":{}}", bashTools), {
-    name: "Bash",
-    arguments: {},
-  });
 });

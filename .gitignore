@@ -2,3 +2,4 @@ node_modules/
 .env
 .ai-bridge-token
 npm-debug.log*
+.ai-bridge-api-key
