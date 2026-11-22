@@ -35,8 +35,36 @@ const SITE_CONFIG = {
     output: ["[class*='message-content']", ".markdown-body", "[class*='markdown']"],
   },
   chatgpt: {
-    input: ["#prompt-textarea", "textarea", "[contenteditable='true'][role='textbox']"],
-    output: ["[data-message-author-role='assistant']"],
+    input: ["#prompt-textarea", "textarea[data-id='root']", "textarea", "[contenteditable='true'][role='textbox']"],
+    output: ["[data-message-author-role='assistant'] .markdown", "[data-message-author-role='assistant']"],
+    send: [
+      "button[data-testid='send-button']",
+      "button[aria-label='Send prompt']",
+      "button[aria-label='Send message']",
+      "button[aria-label*='Send' i]",
+    ],
+    stop: ["button[data-testid='stop-button']", "button[aria-label*='Stop' i]"],
+    userMessage: "[data-message-author-role='user']",
+    loginPaths: ["/auth/login", "/login", "/signin"],
+    errorSelectors: [
+      "[role='alert']",
+      "[data-testid*='error' i]",
+      "[data-testid*='banner' i]",
+      "[class*='rate-limit' i]",
+      "[class*='error' i]",
+    ],
+    errorPatterns: [
+      /you(?:'|’)?ve reached (?:the )?(?:current )?usage cap/i,
+      /message limit reached/i,
+      /too many requests/i,
+      /rate limit/i,
+      /try again in \d+/i,
+      /temporarily unavailable/i,
+      /at (?:the )?capacity/i,
+    ],
+    verifyComposer: true,
+    verifySubmission: true,
+    requireResponse: true,
   },
   claude: {
     input: ["[contenteditable='true'][role='textbox']", "[contenteditable='true']", "textarea"],
@@ -71,15 +99,23 @@ async function runRequest({ id, prompt }) {
   runningRequest = id;
   try {
     const config = SITE_CONFIG[PROVIDER];
+    const promptText = resolvePromptModelName(prompt);
+    const loginIssue = detectLoginIssue(config);
+    if (loginIssue) throw new Error(loginIssue);
+    const visibleError = detectProviderError(config);
+    if (visibleError) throw new Error(visibleError);
     const previousText = latestResponseText(config);
     const composer = findVisible(config.input);
     if (!composer) throw new Error("Could not find the chat composer. Make sure the page is fully loaded and you are signed in.");
-    setComposerText(composer, resolvePromptModelName(prompt));
+    if (!isComposerReady(composer)) throw new Error("The chat composer is disabled or read-only. Reload the tab and retry.");
+    setComposerText(composer, promptText);
     await delay(80);
-    if (!clickSendButton()) {
+    if (config.verifyComposer && !composerContains(composer, promptText)) throw new Error("The full prompt could not be verified in the composer. Reload the tab and retry.");
+    if (!clickSendButton(config)) {
       composer.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true, cancelable: true }));
       composer.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true, cancelable: true }));
     }
+    if (config.verifySubmission && !(await waitForSubmission(composer, config, promptText))) throw new Error("ChatGPT did not confirm that the prompt was sent. Reload the tab and retry.");
     await streamLatestResponse(id, config, previousText);
   } finally {
     runningRequest = null;
@@ -111,15 +147,78 @@ function setComposerText(element, text) {
   element.dispatchEvent(new Event("change", { bubbles: true }));
 }
 
-function clickSendButton() {
-  const candidates = document.querySelectorAll([
+function clickSendButton(config) {
+  const selectors = config?.send ?? [
     "button[aria-label*='Send' i]", "button[aria-label*='Submit' i]", "button[aria-label*='发送']",
     "button[data-testid*='send' i]", "button[class*='send' i]",
-  ].join(","));
+  ];
+  const candidates = document.querySelectorAll(selectors.join(","));
   const button = [...candidates].find((item) => isVisible(item) && !item.disabled && item.getAttribute("aria-disabled") !== "true");
   if (!button) return false;
   button.click();
   return true;
+}
+
+function isComposerReady(element) {
+  if (element.disabled || element.getAttribute("aria-disabled") === "true") return false;
+  if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) return !element.readOnly;
+  return element.isContentEditable !== false;
+}
+
+function normalizeForMatch(value) {
+  return String(value ?? "").replace(/\u200b/g, "").replace(/\s+/g, " ").trim();
+}
+
+function composerContains(element, text) {
+  const value = element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement
+    ? element.value
+    : element.innerText ?? element.textContent ?? "";
+  const expected = normalizeForMatch(text);
+  const actual = normalizeForMatch(value);
+  const prefix = expected.slice(0, 80);
+  return expected.length > 0 && (actual === expected || actual.includes(prefix));
+}
+
+function lastUserMessageMatches(config, text) {
+  if (!config.userMessage) return false;
+  const nodes = [...document.querySelectorAll(config.userMessage)].filter(isVisible);
+  const last = nodes.at(-1);
+  if (!last) return false;
+  const message = normalizeForMatch(last.innerText ?? last.textContent ?? "");
+  const expected = normalizeForMatch(text).slice(0, 80);
+  return message.length > 0 && (message.includes(expected) || expected.includes(message.slice(0, 80)));
+}
+
+async function waitForSubmission(composer, config, text) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < 4000) {
+    if (isGenerating(config)) return true;
+    if (lastUserMessageMatches(config, text)) return true;
+    if (!composerContains(composer, text)) return true;
+    const error = detectProviderError(config);
+    if (error) throw new Error(error);
+    await delay(150);
+  }
+  return false;
+}
+
+function detectLoginIssue(config) {
+  if (!config.loginPaths) return null;
+  const path = location.pathname.toLowerCase();
+  if (config.loginPaths.some((marker) => path.startsWith(marker))) return "ChatGPT is signed out. Sign in in this tab, then retry.";
+  const loginSelectors = ["input[type='password']", "button[data-testid*='login' i]", "a[href*='/auth/login']"].join(",");
+  if ([...document.querySelectorAll(loginSelectors)].some(isVisible)) return "ChatGPT is signed out. Sign in in this tab, then retry.";
+  return null;
+}
+
+function detectProviderError(config) {
+  if (!config.errorPatterns || !config.errorSelectors) return null;
+  const nodes = [...document.querySelectorAll(config.errorSelectors)].filter(isVisible);
+  const text = cleanText(nodes.map((node) => node.innerText ?? node.textContent ?? "").join("\n"));
+  if (!text) return null;
+  const matched = config.errorPatterns.find((pattern) => pattern.test(text));
+  if (!matched) return null;
+  return `ChatGPT reported an error or limit: ${text.slice(0, 200)}`;
 }
 
 async function streamLatestResponse(id, config, beforeText) {
@@ -131,8 +230,10 @@ async function streamLatestResponse(id, config, beforeText) {
 
   while (Date.now() - startedAt < 230_000) {
     await delay(350);
-    const generating = isGenerating();
+    const generating = isGenerating(config);
     sawGenerating ||= generating;
+    const visibleError = detectProviderError(config);
+    if (visibleError) throw new Error(visibleError);
     const current = latestResponseText(config);
     if (current && current !== beforeText) {
       sawResponse = true;
@@ -143,6 +244,7 @@ async function streamLatestResponse(id, config, beforeText) {
     }
     const quietFor = Date.now() - lastChangeAt;
     if (sawResponse && ((!generating && sawGenerating && quietFor > 800) || (!sawGenerating && quietFor > 3500))) {
+      if (config.requireResponse && !lastText) throw new Error("ChatGPT did not return a visible response. Check the tab and retry.");
       if (config.streamFinalOnly && lastText) report({ type: "bridge:chunk", id, text: lastText });
       report({ type: "bridge:complete", id, text: lastText });
       return;
@@ -293,9 +395,9 @@ function cleanMarkdown(value) {
     .trim();
 }
 
-function isGenerating() {
-  return [...document.querySelectorAll("button[aria-label*='Stop' i], button[aria-label*='停止'], button[data-testid*='stop' i]")]
-    .some(isVisible);
+function isGenerating(config) {
+  const selectors = config?.stop ?? ["button[aria-label*='Stop' i]", "button[aria-label*='停止']", "button[data-testid*='stop' i]"];
+  return [...document.querySelectorAll(selectors.join(","))].some(isVisible);
 }
 
 function findVisible(selectors) {
