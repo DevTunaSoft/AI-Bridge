@@ -44,8 +44,8 @@ const SITE_CONFIG = {
     streamFinalOnly: true,
   },
   zai: {
-    input: ["textarea", "[contenteditable='true'][role='textbox']", "[contenteditable='true']"],
-    output: ["[class*='markdown']", "[class*='message-content']"],
+    input: ["textarea", "[contenteditable='true'][role='textbox']", "[contenteditable='true']", "div[contenteditable='true']"],
+    output: ["[class*='markdown']", "[class*='message-content']", "article [class*='markdown']", "main [class*='markdown']"],
   },
   kimi: {
     input: ["textarea", "[contenteditable='true'][role='textbox']", "[contenteditable='true']"],
@@ -73,9 +73,16 @@ async function runRequest({ id, prompt }) {
     const config = SITE_CONFIG[PROVIDER];
     const previousText = latestResponseText(config);
     const composer = findVisible(config.input);
-    if (!composer) throw new Error("Could not find the chat composer. Make sure the page is fully loaded and you are signed in.");
-    setComposerText(composer, resolvePromptModelName(prompt));
+    if (!composer) {
+      if (PROVIDER === "zai" && isZaiLoginPage()) throw new Error("Z.ai requires sign-in. Open chat.z.ai, sign in, and retry.");
+      throw new Error("Could not find the chat composer. Make sure the page is fully loaded and you are signed in.");
+    }
+    const fullPrompt = resolvePromptModelName(prompt);
+    setComposerText(composer, fullPrompt);
     await delay(80);
+    if (PROVIDER === "zai" && readComposerText(composer).trim() !== fullPrompt.trim()) {
+      throw new Error("Z.ai composer did not retain the full prompt; submission aborted to avoid a truncated request.");
+    }
     if (!clickSendButton()) {
       composer.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true, cancelable: true }));
       composer.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true, cancelable: true }));
@@ -134,6 +141,10 @@ async function streamLatestResponse(id, config, beforeText) {
     const generating = isGenerating();
     sawGenerating ||= generating;
     const current = latestResponseText(config);
+    if (PROVIDER === "zai") {
+      const providerError = zaiRateLimitOrError(current);
+      if (providerError) throw new Error(`Z.ai returned an error or rate limit: ${providerError}.`);
+    }
     if (current && current !== beforeText) {
       sawResponse = true;
       const delta = current.startsWith(lastText) ? current.slice(lastText.length) : current;
@@ -330,6 +341,24 @@ function detectProvider(host) {
   if (host.endsWith("chat.z.ai")) return "zai";
   if (host.endsWith("www.kimi.com") || host.endsWith("kimi.com")) return "kimi";
   return null;
+}
+
+function readComposerText(element) {
+  if (!element) return "";
+  if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) return element.value ?? "";
+  return element.textContent ?? "";
+}
+
+function isZaiLoginPage() {
+  if (PROVIDER !== "zai") return false;
+  const text = (document.body?.innerText || "").toLowerCase();
+  return /sign in|log in/.test(text) && !findVisible(SITE_CONFIG.zai.input);
+}
+
+function zaiRateLimitOrError(text) {
+  if (!text) return null;
+  const match = String(text).match(/rate limit|too many requests|429|capacity|try again later|something went wrong|unauthorized/i);
+  return match ? match[0] : null;
 }
 
 function delay(ms) {
